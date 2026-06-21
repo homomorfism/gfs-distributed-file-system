@@ -1,0 +1,150 @@
+syntax = "proto3";
+
+package gfs;
+
+// =====================================================================
+// Naming server (the "master"): the single metadata authority.
+// It knows every file, every chunk, and which storage servers hold
+// each chunk replica. It never stores chunk *content*.
+// =====================================================================
+service NamingServer {
+  // --- Storage-server cluster membership ---
+  rpc RegisterStorage(RegisterStorageRequest) returns (RegisterStorageResponse);
+  rpc Heartbeat(HeartbeatRequest) returns (HeartbeatResponse);
+
+  // --- Client metadata operations ---
+  // CreateFile reserves metadata and returns a placement plan telling the
+  // client which storage servers to upload each chunk to.
+  rpc CreateFile(CreateFileRequest) returns (CreateFileResponse);
+  // CommitFile finalizes a file once the client has uploaded every replica.
+  rpc CommitFile(CommitFileRequest) returns (CommitFileResponse);
+  // GetFile returns the chunk layout + replica locations needed to read.
+  rpc GetFile(GetFileRequest) returns (GetFileResponse);
+  rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
+  rpc GetFileSize(GetFileSizeRequest) returns (GetFileSizeResponse);
+  rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+}
+
+// =====================================================================
+// Storage server (the "chunkserver"): stores raw chunk bytes on its own
+// local file system. Holds only the subset of chunks assigned to it.
+// =====================================================================
+service StorageServer {
+  rpc StoreChunk(StoreChunkRequest) returns (StoreChunkResponse);
+  rpc GetChunk(GetChunkRequest) returns (GetChunkResponse);
+  rpc DeleteChunk(DeleteChunkRequest) returns (DeleteChunkResponse);
+}
+
+// ---------- membership ----------
+message RegisterStorageRequest {
+  string address = 1; // host:port the storage server is reachable at
+}
+message RegisterStorageResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message HeartbeatRequest {
+  string address = 1;
+  repeated string chunk_ids = 2; // chunks this server currently holds
+}
+message HeartbeatResponse {
+  bool ok = 1;
+}
+
+// ---------- placement plan ----------
+message ChunkPlacement {
+  int32 index = 1;            // position of this chunk within the file
+  string chunk_id = 2;        // globally-unique chunk identifier
+  repeated string locations = 3; // storage-server addresses to replicate to
+}
+
+// ---------- create ----------
+message CreateFileRequest {
+  string filename = 1;
+  int64 size = 2;       // total file size in bytes
+  int32 num_chunks = 3; // number of 1 KB chunks (last may be smaller)
+}
+message CreateFileResponse {
+  bool ok = 1;
+  string message = 2;
+  repeated ChunkPlacement placements = 3;
+}
+
+message CommitFileRequest {
+  string filename = 1;
+}
+message CommitFileResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+// ---------- read ----------
+message GetFileRequest {
+  string filename = 1;
+}
+message GetFileResponse {
+  bool ok = 1;
+  string message = 2;
+  int64 size = 3;
+  repeated ChunkPlacement placements = 4; // ordered by index
+}
+
+// ---------- delete ----------
+message DeleteFileRequest {
+  string filename = 1;
+}
+message DeleteFileResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+// ---------- size ----------
+message GetFileSizeRequest {
+  string filename = 1;
+}
+message GetFileSizeResponse {
+  bool ok = 1;
+  string message = 2;
+  int64 size = 3;
+  int32 num_chunks = 4;
+}
+
+// ---------- list ----------
+message ListFilesRequest {}
+message FileInfo {
+  string filename = 1;
+  int64 size = 2;
+  int32 num_chunks = 3;
+  string status = 4;
+}
+message ListFilesResponse {
+  repeated FileInfo files = 1;
+}
+
+// ---------- storage-server chunk I/O ----------
+message StoreChunkRequest {
+  string chunk_id = 1;
+  bytes data = 2;
+}
+message StoreChunkResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message GetChunkRequest {
+  string chunk_id = 1;
+}
+message GetChunkResponse {
+  bool ok = 1;
+  string message = 2;
+  bytes data = 3;
+}
+
+message DeleteChunkRequest {
+  string chunk_id = 1;
+}
+message DeleteChunkResponse {
+  bool ok = 1;
+  string message = 2;
+}

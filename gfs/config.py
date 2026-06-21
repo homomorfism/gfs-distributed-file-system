@@ -1,0 +1,21 @@
+"""Shared constants and small helpers for the GFS clone."""
+import math
+
+# Fixed chunk size mandated by the requirements: 1 KB.
+CHUNK_SIZE = 1024
+
+# Default replication factor (each chunk lives on this many storage servers).
+# Must be > 1 per the requirements. Overridable via env on the naming server.
+DEFAULT_REPLICATION_FACTOR = 2
+
+# Seconds without a heartbeat before a storage server is considered dead.
+HEARTBEAT_TIMEOUT = 15
+# How often storage servers send heartbeats.
+HEARTBEAT_INTERVAL = 5
+
+
+def num_chunks_for_size(size: int) -> int:
+    """Number of fixed-size chunks needed to hold `size` bytes."""
+    if size <= 0:
+        return 0
+    return math.ceil(size / CHUNK_SIZE)

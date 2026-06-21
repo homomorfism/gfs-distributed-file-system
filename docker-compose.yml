@@ -1,0 +1,82 @@
+# GFS clone: 1 naming server + 3 storage servers + a client helper.
+#
+#   docker compose up --build -d        # start the cluster
+#   docker compose run --rm client ...   # run client commands (see README)
+#
+# Replication factor is 2 (each chunk on 2 of the 3 storage servers), so the
+# cluster tolerates the loss of any single storage server.
+
+services:
+  naming:
+    build: .
+    image: gfs
+    command: ["python", "-m", "gfs.naming_server"]
+    environment:
+      PORT: "50051"
+      METADATA_DB: "/data/metadata.db"
+      REPLICATION_FACTOR: "2"
+    ports:
+      - "50051:50051"   # exposed so a client on the host can connect too
+    volumes:
+      - naming-data:/data
+
+  storage1:
+    image: gfs
+    build: .
+    command: ["python", "-m", "gfs.storage_server"]
+    environment:
+      PORT: "50061"
+      DATA_DIR: "/data/chunks"
+      NAMING_SERVER: "naming:50051"
+      ADVERTISE_ADDR: "storage1:50061"
+    volumes:
+      - storage1-data:/data
+    depends_on:
+      - naming
+
+  storage2:
+    image: gfs
+    build: .
+    command: ["python", "-m", "gfs.storage_server"]
+    environment:
+      PORT: "50061"
+      DATA_DIR: "/data/chunks"
+      NAMING_SERVER: "naming:50051"
+      ADVERTISE_ADDR: "storage2:50061"
+    volumes:
+      - storage2-data:/data
+    depends_on:
+      - naming
+
+  storage3:
+    image: gfs
+    build: .
+    command: ["python", "-m", "gfs.storage_server"]
+    environment:
+      PORT: "50061"
+      DATA_DIR: "/data/chunks"
+      NAMING_SERVER: "naming:50051"
+      ADVERTISE_ADDR: "storage3:50061"
+    volumes:
+      - storage3-data:/data
+    depends_on:
+      - naming
+
+  # Helper container for running client commands inside the compose network.
+  # It stays up (sleep) so you can `docker compose exec` or `run` against it.
+  client:
+    image: gfs
+    build: .
+    command: ["sleep", "infinity"]
+    environment:
+      NAMING_SERVER: "naming:50051"
+    volumes:
+      - ./samples:/samples
+    depends_on:
+      - naming
+
+volumes:
+  naming-data:
+  storage1-data:
+  storage2-data:
+  storage3-data:
