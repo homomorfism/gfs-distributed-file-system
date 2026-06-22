@@ -1,10 +1,10 @@
-# GFS clone: 1 naming server + 3 storage servers + a client helper.
+# GFS clone: 1 naming server + 4 storage servers + a client helper.
 #
 #   docker compose up --build -d        # start the cluster
 #   docker compose run --rm client ...   # run client commands (see README)
 #
-# Replication factor is 2 (each chunk on 2 of the 3 storage servers), so the
-# cluster tolerates the loss of any single storage server.
+# Replication factor is 3 (each chunk on 3 of the 4 storage servers), so the
+# cluster can heal a single storage loss onto the remaining live spare.
 
 services:
   naming:
@@ -14,7 +14,7 @@ services:
     environment:
       PORT: "50051"
       METADATA_DB: "/data/metadata.db"
-      REPLICATION_FACTOR: "2"
+      REPLICATION_FACTOR: "3"
     ports:
       - "50051:50051"   # exposed so a client on the host can connect too
     volumes:
@@ -62,6 +62,20 @@ services:
     depends_on:
       - naming
 
+  storage4:
+    image: gfs
+    build: .
+    command: ["python", "-m", "gfs.storage_server"]
+    environment:
+      PORT: "50061"
+      DATA_DIR: "/data/chunks"
+      NAMING_SERVER: "naming:50051"
+      ADVERTISE_ADDR: "storage4:50061"
+    volumes:
+      - storage4-data:/data
+    depends_on:
+      - naming
+
   # Helper container for running client commands inside the compose network.
   # It stays up (sleep) so you can `docker compose exec` or `run` against it.
   client:
@@ -80,3 +94,4 @@ volumes:
   storage1-data:
   storage2-data:
   storage3-data:
+  storage4-data:

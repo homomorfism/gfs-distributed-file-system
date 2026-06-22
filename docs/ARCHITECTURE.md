@@ -11,7 +11,8 @@ distinguishes critical from non-critical failures.
 ### Naming server (single — the "master")
 The metadata authority. It holds, for every file, the ordered list of chunks
 and, for every chunk, the set of storage servers that hold a replica. It also
-tracks which storage servers are currently alive.
+tracks which storage servers are currently alive and repairs chunks that fall
+below the target number of live replicas.
 
 It exposes (gRPC):
 - `RegisterStorage` / `Heartbeat` — cluster membership and liveness.
@@ -32,7 +33,8 @@ Each stores only the chunks assigned to it — never the whole dataset — as pl
 files (`<chunk_id>.chunk`) under `DATA_DIR` on its local file system. This
 satisfies "chunk content stored in the file system, not in a database." On
 startup each registers with the naming server and then heartbeats every few
-seconds. It exposes `StoreChunk`, `GetChunk`, `DeleteChunk`.
+seconds. It exposes `StoreChunk`, `GetChunk`, `DeleteChunk`, and
+`ReplicateChunk` for server-to-server repair.
 
 ### Client
 A library + CLI that hides distribution from the user. The user deals in whole
@@ -52,8 +54,8 @@ the naming server is never in the data path.
   both the metadata key and the on-disk filename. Unique ids mean chunks from
   different files never collide on a storage server.
 - **Replication:** every chunk is written to `REPLICATION_FACTOR` distinct
-  storage servers (default **2**, required to be > 1). The naming server picks
-  replicas round-robin across the live servers to spread load.
+  storage servers (default **3**, required to be > 1). The Docker cluster runs
+  four storage servers so one failure still leaves a live repair target.
 - **Storage separation:** metadata in SQLite on the naming server; content in
   files on storage-server disks. The two layers are independent services.
 
@@ -71,9 +73,19 @@ A crash between steps 2 and 4 leaves a `pending` row that is invisible to reads
 
 ### Read path
 1. `GetFile` → ordered chunk list + replica locations.
-2. For each chunk the client tries replicas **in order** and uses the first that
-   responds — so a single dead replica is transparent.
+2. The naming server returns live replica locations first. For each chunk the
+   client tries replicas **in order** and uses the first that responds — so a
+   single dead replica is transparent.
 3. Client concatenates the chunks and returns the original bytes.
+
+### Self-healing path
+The naming server periodically scans committed chunks. If a chunk has fewer
+than `REPLICATION_FACTOR` live replicas and at least one live source replica,
+the naming server asks a live storage server that does not yet hold the chunk to
+run `ReplicateChunk`. The target server pulls bytes directly from the surviving
+source, stores the chunk on disk, and then the naming server records the new
+replica in SQLite. When the repair replaces a dead server, stale metadata is
+removed so the committed layout stays at exactly R replicas.
 
 ### Delete path
 The naming server tells every replica to drop the chunk (idempotent), then
@@ -96,24 +108,29 @@ Answered purely from the `files` table — no chunk transfer, as required.
 | Client reads directly from storage servers | Keeps the master off the data path → scalable. | Client must handle replica fallback (it does). |
 | SQLite for metadata | Durable across naming-server restarts; zero-ops. | Single-node; not a distributed store. |
 | Fixed tiny 1 KB chunk | Required; makes sharding/replication visible. | High per-chunk overhead vs. real GFS (64 MB); fine for a teaching system. |
-| Replication factor 2 (default) | "More than one"; tolerates one failure with 3 servers. | Only survives 1 simultaneous storage failure; raise the factor for more. |
+| Replication factor 3 (default) | Survives up to 2 simultaneous failures for a chunk while one replica remains; 4 storage servers leave a spare repair target after one failure. | Higher storage cost and slower writes than R=2. |
+| Server-to-server self-healing | Restores chunks to R live replicas after a storage failure without client involvement. | Needs at least R live storage servers and one surviving source replica. |
 
 ---
 
 ## 4. Fault-tolerance analysis
 
 ### 4.1 Storage server down — **non-critical (survivable)**
-Because every chunk lives on ≥ 2 servers, losing one storage server does not
-lose data:
+Because every chunk lives on 3 distinct servers by default, losing one storage
+server does not lose data:
 - **Reads:** fully available. The client falls back to another replica
   (verified: stop a storage server, reads still succeed).
 - **Writes:** still possible as long as at least `REPLICATION_FACTOR` servers
   remain live — the naming server only places chunks on live servers. With the
-  default 3 servers / factor 2, one can be down and writes continue; if only 1
-  remains, `CreateFile` is rejected with a clear error rather than silently
-  under-replicating.
-- **Recovery:** when the server comes back it re-registers and its on-disk
-  chunks are usable again.
+  default 4 servers / factor 3, one can be down and writes continue; if fewer
+  than 3 remain, `CreateFile` is rejected with a clear error rather than
+  silently under-replicating.
+- **Self-healing:** when a dead server held a chunk, the naming server orders a
+  surviving replica to copy that chunk to the live spare server, restoring 3
+  live replicas. If too few servers remain live, repair waits for recovery.
+- **Recovery:** when the server comes back it re-registers. Any chunk files no
+  longer referenced by metadata are harmless orphans; a future sweeper can
+  reclaim them.
 
 ### 4.2 Naming server down — **CRITICAL (single point of failure)**
 The naming server is the **only** place that maps files to chunk locations.
@@ -135,15 +152,18 @@ While it is down:
 With replication factor **R** and replicas spread across distinct servers, a
 chunk is lost only if **all R servers holding it fail simultaneously**. So the
 system tolerates **R − 1 simultaneous storage-server failures** without data
-loss (default R = 2 → tolerates **1**). Increasing `REPLICATION_FACTOR` (with
-enough storage servers) directly raises the number of tolerated simultaneous
-failures, at the cost of more storage and slower writes.
+loss (default R = 3 → tolerates **2** for a chunk). Immediate re-replication
+requires enough live capacity: after one failure in the default 4-server
+cluster, there are still 3 live servers, so repair can restore R. After two
+failures, reads may still succeed from the last replica, but the cluster cannot
+restore R until a failed storage server returns or another storage server is
+added.
 
 ### 4.4 Recoverable vs. unrecoverable
 
 | Failure | Data loss? | Available during? | Recoverable? |
 | --- | --- | --- | --- |
-| 1 storage server down (R = 2) | No | Yes (reads + writes) | Yes — comes back and rejoins |
+| 1 storage server down (R = 3, 4 servers) | No | Yes (reads + writes) | Yes — self-heals to the live spare |
 | R or more servers holding the *same* chunk down at once | **Yes, for those chunks** | Partial | Only if a replica disk survives |
 | Naming server process crash | No (metadata on disk) | **No** (whole system unavailable) | Yes — restart reloads SQLite |
 | Naming server metadata (SQLite) destroyed | **Yes** (file index lost) | No | No — chunks exist but are unmappable |

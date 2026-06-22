@@ -29,11 +29,11 @@ fault-tolerance analysis.
             heartbeat        │
         ┌─────────┬──────────┼───────────┬─────────┐
         │         │          │           │         │
-   ┌────▼───┐ ┌───▼────┐ ┌───▼────┐      │   chunk bytes (direct)
-   │storage1│ │storage2│ │storage3│ ◄────┘
-   │ chunks │ │ chunks │ │ chunks │   each holds only a SUBSET of chunks,
-   │ on disk│ │ on disk│ │ on disk│   content stored as files (not in a DB)
-   └────────┘ └────────┘ └────────┘
+   ┌────▼───┐ ┌───▼────┐ ┌───▼────┐ ┌────▼───┐  chunk bytes (direct)
+   │storage1│ │storage2│ │storage3│ │storage4│
+   │ chunks │ │ chunks │ │ chunks │ │ chunks │  each holds only a SUBSET,
+   │ on disk│ │ on disk│ │ on disk│ │ on disk│  content stored as files
+   └────────┘ └────────┘ └────────┘ └────────┘  (not in a DB)
         ▲                                   ▲
         └───────────  Client  ──────────────┘
         splits/reassembles files, talks to the master for metadata
@@ -42,7 +42,8 @@ fault-tolerance analysis.
 
 - **Naming server** — single source of truth for metadata. Picks which storage
   servers each chunk is replicated to, answers read/size queries, and
-  orchestrates deletes. Never stores chunk content.
+  orchestrates deletes and background replica repair. Never stores chunk
+  content.
 - **Storage servers** — each stores only the chunks assigned to it, as plain
   files under `DATA_DIR`. Register with the naming server and send heartbeats.
 - **Client** — a library (`gfs.client.GFSClient`) plus a CLI
@@ -61,8 +62,9 @@ Communication is **gRPC** (see [`proto/gfs.proto`](proto/gfs.proto)).
 
 ## Run with Docker (recommended)
 
-The default cluster is **1 naming server + 3 storage servers**, replication
-factor **2** (so it tolerates losing any one storage server).
+The default cluster is **1 naming server + 4 storage servers**, replication
+factor **3**. A single storage failure leaves two live replicas and one spare
+target, so the naming server can repair back to three live replicas.
 
 ```bash
 docker compose up --build -d        # build images & start the cluster
@@ -104,6 +106,7 @@ docker compose exec client python -m gfs.client delete hello.txt
 docker compose exec client python -m gfs.client create /samples/hello.txt hello.txt
 docker compose stop storage1                                   # kill a storage server
 docker compose exec client python -m gfs.client read hello.txt # still works (replica)
+docker compose logs naming                                     # shows self-healing
 docker compose start storage1
 ```
 
@@ -121,7 +124,7 @@ docker compose down -v    # stop and wipe all data volumes
 | Service   | Container port | Host port | Purpose                         |
 | --------- | -------------- | --------- | ------------------------------- |
 | naming    | 50051          | 50051     | metadata gRPC (client + storage)|
-| storage1-3| 50061          | —         | chunk I/O gRPC (internal)       |
+| storage1-4| 50061          | —         | chunk I/O gRPC (internal)       |
 
 Only the naming server is published to the host; storage servers talk to it on
 the internal compose network. A client running on the host can connect with
@@ -135,7 +138,8 @@ the internal compose network. A client running on the host can connect with
 | -------------------- | -------------------- | ---------------------------------------- |
 | `PORT`               | `50051`              | gRPC listen port                         |
 | `METADATA_DB`        | `/data/metadata.db`  | SQLite metadata file (metadata only)     |
-| `REPLICATION_FACTOR` | `2`                  | replicas per chunk (must be > 1)         |
+| `REPLICATION_FACTOR` | `3`                  | replicas per chunk (must be > 1)         |
+| `HEAL_INTERVAL`      | `5`                  | seconds between self-healing scans       |
 
 **Storage server**
 
@@ -160,6 +164,8 @@ python scripts/gen_proto.py            # generate gRPC stubs (gitignored)
 PORT=50051 METADATA_DB=./data/meta.db python -m gfs.naming_server
 PORT=50061 DATA_DIR=./data/s1 NAMING_SERVER=localhost:50051 ADVERTISE_ADDR=localhost:50061 python -m gfs.storage_server
 PORT=50062 DATA_DIR=./data/s2 NAMING_SERVER=localhost:50051 ADVERTISE_ADDR=localhost:50062 python -m gfs.storage_server
+PORT=50063 DATA_DIR=./data/s3 NAMING_SERVER=localhost:50051 ADVERTISE_ADDR=localhost:50063 python -m gfs.storage_server
+PORT=50064 DATA_DIR=./data/s4 NAMING_SERVER=localhost:50051 ADVERTISE_ADDR=localhost:50064 python -m gfs.storage_server
 
 # then use the client:
 NAMING_SERVER=localhost:50051 python -m gfs.client create samples/hello.txt hello.txt
@@ -173,15 +179,15 @@ NAMING_SERVER=localhost:50051 python -m gfs.client read hello.txt
 ## Tests
 
 End-to-end tests spin up a naming server and several storage servers in one
-process and exercise create / read / size / delete plus a storage-server
-failure:
+process and exercise create / read / size / delete, storage-server failure,
+and self-healing back to the target replication factor:
 
 ```bash
 python scripts/gen_proto.py
 python tests/test_gfs.py
 ```
 
-Expected: `5/5 tests passed`.
+Expected: `6/6 tests passed`.
 
 ---
 
@@ -195,7 +201,7 @@ gfs/storage_server/        chunkserver: stores chunk files + heartbeats
 gfs/client/                client library + CLI
 scripts/gen_proto.py       generates the gRPC stubs (into gfs/_generated/)
 tests/test_gfs.py          end-to-end tests incl. fault tolerance
-docker-compose.yml         1 naming + 3 storage + client helper
+docker-compose.yml         1 naming + 4 storage + client helper
 Dockerfile                 single image for all roles
 docs/ARCHITECTURE.md       design + fault-tolerance analysis
 docs/requirements.md       the assignment

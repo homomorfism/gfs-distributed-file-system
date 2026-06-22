@@ -74,6 +74,32 @@ class StorageServicer(gfs_pb2_grpc.StorageServerServicer):
             pass  # already gone; deletion is idempotent
         return gfs_pb2.DeleteChunkResponse(ok=True, message="deleted")
 
+    def ReplicateChunk(self, request, context):
+        data = _get_chunk_from(request.source_address, request.chunk_id)
+        if data is None:
+            return gfs_pb2.ReplicateChunkResponse(
+                ok=False, message="source chunk unavailable")
+
+        stored = self.StoreChunk(
+            gfs_pb2.StoreChunkRequest(chunk_id=request.chunk_id, data=data),
+            context,
+        )
+        return gfs_pb2.ReplicateChunkResponse(
+            ok=stored.ok, message=stored.message)
+
+
+def _get_chunk_from(address: str, chunk_id: str) -> bytes | None:
+    try:
+        with grpc.insecure_channel(address) as channel:
+            stub = gfs_pb2_grpc.StorageServerStub(channel)
+            resp = stub.GetChunk(
+                gfs_pb2.GetChunkRequest(chunk_id=chunk_id), timeout=10)
+            return resp.data if resp.ok else None
+    except grpc.RpcError as exc:
+        logger.warning("fetch chunk %s from %s failed: %s", chunk_id, address,
+                       exc.code())
+        return None
+
 
 def _heartbeat_loop(naming_addr: str, self_addr: str,
                     servicer: StorageServicer) -> None:

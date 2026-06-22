@@ -5,6 +5,8 @@ Only *metadata* lives here (file -> chunks -> replica locations). Chunk
 Persisting metadata to SQLite lets the naming server survive a restart with
 its file index intact.
 """
+from __future__ import annotations
+
 import sqlite3
 import threading
 from dataclasses import dataclass, field
@@ -103,6 +105,29 @@ class MetadataStore:
             self._conn.commit()
             return cur.rowcount > 0
 
+    def add_replica(self, chunk_id: str, address: str) -> bool:
+        """Record that `address` now stores `chunk_id`."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "INSERT OR IGNORE INTO replicas(chunk_id, address) "
+                "VALUES (?, ?)",
+                (chunk_id, address),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def remove_replica(self, chunk_id: str, address: str) -> bool:
+        """Remove a stale replica location from metadata."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "DELETE FROM replicas WHERE chunk_id = ? AND address = ?",
+                (chunk_id, address),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
     # ---- reads ----
     def get_file(self, filename: str) -> FileMeta | None:
         with self._lock:
@@ -138,6 +163,26 @@ class MetadataStore:
             ).fetchall()
             return [FileMeta(filename=r[0], size=r[1], num_chunks=r[2],
                              status=r[3]) for r in rows]
+
+    def list_committed_chunks(self) -> list[ChunkMeta]:
+        """Return chunks for committed files, with their known replicas."""
+        with self._lock:
+            cur = self._conn.cursor()
+            chunk_rows = cur.execute(
+                "SELECT c.chunk_id, c.idx FROM chunks c "
+                "JOIN files f ON f.filename = c.filename "
+                "WHERE f.status = 'committed' "
+                "ORDER BY c.filename, c.idx"
+            ).fetchall()
+            chunks: list[ChunkMeta] = []
+            for chunk_id, idx in chunk_rows:
+                locs = [r[0] for r in cur.execute(
+                    "SELECT address FROM replicas WHERE chunk_id = ?",
+                    (chunk_id,),
+                ).fetchall()]
+                chunks.append(ChunkMeta(chunk_id=chunk_id, index=idx,
+                                        locations=locs))
+            return chunks
 
     def all_chunk_locations(self, filename: str) -> list[tuple[str, list[str]]]:
         """Return [(chunk_id, [addresses])] for a file (used by delete)."""

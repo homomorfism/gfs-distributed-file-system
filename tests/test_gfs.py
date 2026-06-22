@@ -1,7 +1,7 @@
 """End-to-end tests: spin up a naming server + several storage servers
 in-process and exercise the client, including a storage-server failure.
 
-Run with:  python -m pytest tests/ -v      (or  python tests/test_gfs.py)
+Run with:  python tests/test_gfs.py
 """
 import os
 import sys
@@ -31,11 +31,12 @@ def _start(servicer, add_fn):
 class Cluster:
     """A naming server plus N storage servers, all in this process."""
 
-    def __init__(self, tmpdir, num_storage=3, replication=2):
+    def __init__(self, tmpdir, num_storage=4, replication=3):
         self.servers = []
         store = MetadataStore(os.path.join(tmpdir, "meta.db"))
         self._store = store
-        self.naming_servicer = NamingServicer(store, replication)
+        self.naming_servicer = NamingServicer(
+            store, replication, enable_healing=False)
         naming_server, self.naming_addr = _start(
             self.naming_servicer,
             gfs_pb2_grpc.add_NamingServerServicer_to_server)
@@ -57,9 +58,14 @@ class Cluster:
         return GFSClient(self.naming_addr)
 
     def stop_one_storage(self):
-        addr, srv = next(iter(self.storage.items()))
+        addr = next(iter(self.storage.keys()))
+        return self.stop_storage(addr)
+
+    def stop_storage(self, addr):
+        srv = self.storage[addr]
         srv.stop(0)
         del self.storage[addr]
+        self.naming_servicer._registry.mark_dead(addr)
         return addr
 
     def shutdown(self):
@@ -69,7 +75,7 @@ class Cluster:
 
 
 def run_test(name, fn):
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+    with tempfile.TemporaryDirectory() as tmp:
         cluster = Cluster(tmp)
         try:
             fn(cluster)
@@ -105,9 +111,39 @@ def test_replication_survives_one_failure(cluster):
     content = ("replicate me " * 300).encode()
     client.create("rep.txt", content)
     dead = cluster.stop_one_storage()
-    # With replication factor 2 across 3 servers, one death must not lose data.
+    # With replication factor 3 across 4 servers, one death must not lose data.
     got = client.read("rep.txt")
     assert got == content, f"read failed after {dead} went down"
+
+
+def test_self_healing_restores_replication(cluster):
+    client = cluster.client()
+    content = ("heal this chunk " * 400).encode()
+    client.create("heal.txt", content)
+
+    before = cluster._store.get_file("heal.txt")
+    assert before is not None, "file metadata missing before failure"
+    assert all(len(c.locations) == 3 for c in before.chunks), (
+        "initial placement should use 3 replicas")
+
+    dead = before.chunks[0].locations[0]
+    cluster.stop_storage(dead)
+    repaired = cluster.naming_servicer.heal_once()
+    assert repaired > 0, "healing pass should repair at least one replica"
+
+    after = cluster._store.get_file("heal.txt")
+    assert after is not None, "file metadata missing after healing"
+    live = set(cluster.storage.keys())
+    for chunk in after.chunks:
+        assert len(chunk.locations) == 3, (
+            f"chunk {chunk.index} should be back to exactly 3 replicas")
+        assert dead not in chunk.locations, (
+            f"chunk {chunk.index} still points at dead server {dead}")
+        assert set(chunk.locations).issubset(live), (
+            f"chunk {chunk.index} has non-live locations {chunk.locations}")
+
+    got = client.read("heal.txt")
+    assert got == content, "read after self-healing changed file contents"
 
 
 def test_delete(cluster):
@@ -122,7 +158,7 @@ def test_delete(cluster):
 
 
 def test_create_needs_enough_servers():
-    with tempfile.TemporaryDirectory(ignore_cleanup_errors=True) as tmp:
+    with tempfile.TemporaryDirectory() as tmp:
         cluster = Cluster(tmp, num_storage=1, replication=2)
         try:
             client = cluster.client()
@@ -146,6 +182,8 @@ def main():
     results.append(run_test("size_no_transfer", test_size_no_transfer))
     results.append(run_test("replication_survives_one_failure",
                             test_replication_survives_one_failure))
+    results.append(run_test("self_healing_restores_replication",
+                            test_self_healing_restores_replication))
     results.append(run_test("delete", test_delete))
     results.append(test_create_needs_enough_servers())
     passed = sum(results)

@@ -33,6 +33,9 @@ service StorageServer {
   rpc StoreChunk(StoreChunkRequest) returns (StoreChunkResponse);
   rpc GetChunk(GetChunkRequest) returns (GetChunkResponse);
   rpc DeleteChunk(DeleteChunkRequest) returns (DeleteChunkResponse);
+  // Naming server asks one storage server to repair replication by copying a
+  // chunk from another live storage server.
+  rpc ReplicateChunk(ReplicateChunkRequest) returns (ReplicateChunkResponse);
 }
 
 // ---------- membership ----------
@@ -145,6 +148,15 @@ message DeleteChunkRequest {
   string chunk_id = 1;
 }
 message DeleteChunkResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+message ReplicateChunkRequest {
+  string chunk_id = 1;
+  string source_address = 2;
+}
+message ReplicateChunkResponse {
   bool ok = 1;
   string message = 2;
 }
