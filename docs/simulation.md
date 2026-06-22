@@ -162,6 +162,108 @@ Expected result: both hashes are identical.
 
 ---
 
+## 3b. 1 GB write stress test
+
+A 1 GB file creates roughly 1,024,000 chunks (each 1 KB). With replication factor 3,
+the cluster writes about 3 million chunk replicas across 4 storage servers. This
+exercises chunk placement at scale, metadata growth, and sustained write throughput.
+
+**Expected duration:** 5–20 minutes depending on hardware. The dominant cost is
+gRPC round-trips per chunk replica. Plan accordingly.
+
+### Generate a 1 GB file on the host
+
+Use Python with a reproducible pseudo-random seed so the same "random" data can
+be generated again for verification without storing a 1 GB reference file:
+
+```fish
+uv run python -c '
+import os, hashlib, struct, time
+
+target = "samples/gigabyte.bin"
+size = 1_000_000_000  # 1 GB (decimal)
+seed = 42
+
+t0 = time.monotonic()
+with open(target, "wb") as f:
+    # Write 64-byte blocks — fast enough, and deterministic per position.
+    state = seed.to_bytes(32, "big")
+    written = 0
+    while written < size:
+        chunk = hashlib.sha256(state).digest() + hashlib.sha256(state + b"\x01").digest()
+        f.write(chunk)
+        state = hashlib.sha256(state).digest()
+        written += len(chunk)
+        if written % (100 * 1024 * 1024) == 0:
+            print(f"  {written / 1_000_000:.0f} MB…")
+
+elapsed = time.monotonic() - t0
+actual_size = os.path.getsize(target)
+print(f"Generated {actual_size:,} bytes in {elapsed:.1f}s")
+
+# Print host-side hash for later comparison.
+h = hashlib.sha256()
+with open(target, "rb") as f:
+    for chunk in iter(lambda: f.read(8 * 1024 * 1024), b""):
+        h.update(chunk)
+print(f"host sha256: {h.hexdigest()}")
+'
+```
+
+A faster alternative with `dd` + `/dev/urandom` (macOS-compatible, non-reproducible):
+
+```fish
+dd if=/dev/urandom of=samples/gigabyte.bin bs=1m count=1000 2>/dev/null
+shasum -a 256 samples/gigabyte.bin
+```
+
+### Upload to GFS
+
+The `CreateFile` RPC must persist ~977K chunk placements into SQLite before
+returning. Use `--timeout 300` (5 minutes) to give the naming server enough
+headroom:
+
+```fish
+time docker compose exec client python -m gfs.client --timeout 300 create /samples/gigabyte.bin gigabyte.bin
+docker compose exec client python -m gfs.client size gigabyte.bin
+```
+
+### Read back and verify hashes
+
+```fish
+docker compose exec client python -m gfs.client read gigabyte.bin /tmp/gigabyte-out.bin
+docker compose cp client:/tmp/gigabyte-out.bin /tmp/gfs-gigabyte-out.bin
+
+shasum -a 256 samples/gigabyte.bin /tmp/gfs-gigabyte-out.bin
+```
+
+**Expected result:** both SHA-256 hashes are identical. If they differ, the
+simulation found a data-corruption bug.
+
+### Check cluster state after the write
+
+```fish
+docker compose exec client python -m gfs.client ls
+docker compose logs naming | tail -20
+docker compose stats --no-stream
+```
+
+After the write, the naming server metadata database grows noticeably (each chunk
+row ≈ 100 bytes → ~100 MB for 1 million chunks). The four storage servers together
+hold ~3 GB of chunk data (1 GB × replication factor 3).
+
+### Clean up the 1 GB file
+
+The test file is too large to keep around casually. Delete it from GFS and the
+host when done:
+
+```fish
+docker compose exec client python -m gfs.client delete gigabyte.bin
+rm samples/gigabyte.bin /tmp/gfs-gigabyte-out.bin
+```
+
+---
+
 ## 4. Simulate storage-server failure
 
 Create a file first:

@@ -21,7 +21,8 @@ from gfs.client.client import GFSClient, GFSError
 
 def _client(args) -> GFSClient:
     addr = args.naming or os.environ.get("NAMING_SERVER", "localhost:50051")
-    return GFSClient(addr)
+    timeout = getattr(args, "timeout", 10.0)
+    return GFSClient(addr, timeout=timeout)
 
 
 def cmd_create(args) -> int:
@@ -71,6 +72,9 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="gfs.client",
                                      description="GFS distributed FS client")
     parser.add_argument("--naming", help="naming server address host:port")
+    parser.add_argument("--timeout", type=float, default=10.0,
+                        help="gRPC timeout in seconds (default: 10; use higher "
+                             "values like 300 for multi-GB files)")
     sub = parser.add_subparsers(dest="command", required=True)
 
     p = sub.add_parser("create", help="store a text file")

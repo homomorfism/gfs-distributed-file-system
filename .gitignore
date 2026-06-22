@@ -6,3 +6,4 @@ venv/
 *_pb2_grpc.py
 data/
 .DS_Store
+samples/gigabyte.bin
