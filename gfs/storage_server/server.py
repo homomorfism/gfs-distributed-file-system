@@ -18,17 +18,19 @@ from concurrent import futures
 
 import grpc
 
-from gfs import config
+from gfs import config, metrics
 from gfs._generated import gfs_pb2, gfs_pb2_grpc
 
 logger = logging.getLogger("storage")
 
 
 class StorageServicer(gfs_pb2_grpc.StorageServerServicer):
-    def __init__(self, data_dir: str):
+    def __init__(self, data_dir: str, address: str = "in-process"):
         self._data_dir = data_dir
+        self._address = address
         os.makedirs(data_dir, exist_ok=True)
         self._lock = threading.Lock()
+        self.refresh_metrics()
 
     def _path(self, chunk_id: str) -> str:
         # chunk_id is a uuid hex string -> safe as a filename.
@@ -38,54 +40,78 @@ class StorageServicer(gfs_pb2_grpc.StorageServerServicer):
         return [f[:-6] for f in os.listdir(self._data_dir)
                 if f.endswith(".chunk")]
 
+    def refresh_metrics(self) -> None:
+        chunks = self.held_chunk_ids()
+        total_bytes = 0
+        for chunk_id in chunks:
+            try:
+                total_bytes += os.path.getsize(self._path(chunk_id))
+            except FileNotFoundError:
+                pass
+        metrics.STORAGE_CHUNKS.labels(self._address).set(len(chunks))
+        metrics.STORAGE_BYTES.labels(self._address).set(total_bytes)
+
     def StoreChunk(self, request, context):
-        path = self._path(request.chunk_id)
-        try:
-            with self._lock:
-                # Atomic write: temp file then rename.
-                tmp = path + ".tmp"
-                with open(tmp, "wb") as fh:
-                    fh.write(request.data)
-                os.replace(tmp, path)
-            logger.info("stored chunk %s (%d bytes)", request.chunk_id,
-                        len(request.data))
-            return gfs_pb2.StoreChunkResponse(ok=True, message="stored")
-        except OSError as exc:
-            logger.error("store chunk %s failed: %s", request.chunk_id, exc)
-            return gfs_pb2.StoreChunkResponse(ok=False, message=str(exc))
+        def handle():
+            path = self._path(request.chunk_id)
+            try:
+                with self._lock:
+                    # Atomic write: temp file then rename.
+                    tmp = path + ".tmp"
+                    with open(tmp, "wb") as fh:
+                        fh.write(request.data)
+                    os.replace(tmp, path)
+                metrics.STORAGE_CHUNK_BYTES_WRITTEN.labels(
+                    self._address).inc(len(request.data))
+                logger.info("stored chunk %s (%d bytes)", request.chunk_id,
+                            len(request.data))
+                return gfs_pb2.StoreChunkResponse(ok=True, message="stored")
+            except OSError as exc:
+                logger.error("store chunk %s failed: %s", request.chunk_id, exc)
+                return gfs_pb2.StoreChunkResponse(ok=False, message=str(exc))
+        return metrics.observe_rpc("storage", "StoreChunk", handle)
 
     def GetChunk(self, request, context):
-        path = self._path(request.chunk_id)
-        try:
-            with open(path, "rb") as fh:
-                data = fh.read()
-            return gfs_pb2.GetChunkResponse(ok=True, message="ok", data=data)
-        except FileNotFoundError:
-            return gfs_pb2.GetChunkResponse(ok=False, message="chunk not found")
-        except OSError as exc:
-            return gfs_pb2.GetChunkResponse(ok=False, message=str(exc))
+        def handle():
+            path = self._path(request.chunk_id)
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+                metrics.STORAGE_CHUNK_BYTES_READ.labels(
+                    self._address).inc(len(data))
+                return gfs_pb2.GetChunkResponse(ok=True, message="ok", data=data)
+            except FileNotFoundError:
+                return gfs_pb2.GetChunkResponse(
+                    ok=False, message="chunk not found")
+            except OSError as exc:
+                return gfs_pb2.GetChunkResponse(ok=False, message=str(exc))
+        return metrics.observe_rpc("storage", "GetChunk", handle)
 
     def DeleteChunk(self, request, context):
-        path = self._path(request.chunk_id)
-        try:
-            os.remove(path)
-            logger.info("deleted chunk %s", request.chunk_id)
-        except FileNotFoundError:
-            pass  # already gone; deletion is idempotent
-        return gfs_pb2.DeleteChunkResponse(ok=True, message="deleted")
+        def handle():
+            path = self._path(request.chunk_id)
+            try:
+                os.remove(path)
+                logger.info("deleted chunk %s", request.chunk_id)
+            except FileNotFoundError:
+                pass  # already gone; deletion is idempotent
+            return gfs_pb2.DeleteChunkResponse(ok=True, message="deleted")
+        return metrics.observe_rpc("storage", "DeleteChunk", handle)
 
     def ReplicateChunk(self, request, context):
-        data = _get_chunk_from(request.source_address, request.chunk_id)
-        if data is None:
-            return gfs_pb2.ReplicateChunkResponse(
-                ok=False, message="source chunk unavailable")
+        def handle():
+            data = _get_chunk_from(request.source_address, request.chunk_id)
+            if data is None:
+                return gfs_pb2.ReplicateChunkResponse(
+                    ok=False, message="source chunk unavailable")
 
-        stored = self.StoreChunk(
-            gfs_pb2.StoreChunkRequest(chunk_id=request.chunk_id, data=data),
-            context,
-        )
-        return gfs_pb2.ReplicateChunkResponse(
-            ok=stored.ok, message=stored.message)
+            stored = self.StoreChunk(
+                gfs_pb2.StoreChunkRequest(chunk_id=request.chunk_id, data=data),
+                context,
+            )
+            return gfs_pb2.ReplicateChunkResponse(
+                ok=stored.ok, message=stored.message)
+        return metrics.observe_rpc("storage", "ReplicateChunk", handle)
 
 
 def _get_chunk_from(address: str, chunk_id: str) -> bytes | None:
@@ -117,6 +143,8 @@ def _heartbeat_loop(naming_addr: str, self_addr: str,
                             address=self_addr,
                             chunk_ids=servicer.held_chunk_ids()),
                         timeout=5)
+                    servicer.refresh_metrics()
+                    metrics.STORAGE_HEARTBEATS.labels(self_addr).inc()
                     time.sleep(config.HEARTBEAT_INTERVAL)
         except grpc.RpcError as exc:
             logger.warning("naming server unreachable (%s); retrying",
@@ -135,7 +163,8 @@ def serve() -> None:
     # Address other containers/clients use to reach this server.
     self_addr = os.environ.get("ADVERTISE_ADDR", f"localhost:{port}")
 
-    servicer = StorageServicer(data_dir)
+    metrics.start_metrics_server_from_env()
+    servicer = StorageServicer(data_dir, self_addr)
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
     gfs_pb2_grpc.add_StorageServerServicer_to_server(servicer, server)
     server.add_insecure_port(f"[::]:{port}")

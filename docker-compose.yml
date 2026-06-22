@@ -15,6 +15,7 @@ services:
       PORT: "50051"
       METADATA_DB: "/data/metadata.db"
       REPLICATION_FACTOR: "3"
+      METRICS_PORT: "8000"
     ports:
       - "50051:50051"   # exposed so a client on the host can connect too
     volumes:
@@ -29,6 +30,7 @@ services:
       DATA_DIR: "/data/chunks"
       NAMING_SERVER: "naming:50051"
       ADVERTISE_ADDR: "storage1:50061"
+      METRICS_PORT: "8000"
     volumes:
       - storage1-data:/data
     depends_on:
@@ -43,6 +45,7 @@ services:
       DATA_DIR: "/data/chunks"
       NAMING_SERVER: "naming:50051"
       ADVERTISE_ADDR: "storage2:50061"
+      METRICS_PORT: "8000"
     volumes:
       - storage2-data:/data
     depends_on:
@@ -57,6 +60,7 @@ services:
       DATA_DIR: "/data/chunks"
       NAMING_SERVER: "naming:50051"
       ADVERTISE_ADDR: "storage3:50061"
+      METRICS_PORT: "8000"
     volumes:
       - storage3-data:/data
     depends_on:
@@ -71,6 +75,7 @@ services:
       DATA_DIR: "/data/chunks"
       NAMING_SERVER: "naming:50051"
       ADVERTISE_ADDR: "storage4:50061"
+      METRICS_PORT: "8000"
     volumes:
       - storage4-data:/data
     depends_on:
@@ -89,9 +94,44 @@ services:
     depends_on:
       - naming
 
+  prometheus:
+    image: prom/prometheus:v3.3.1
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--storage.tsdb.path=/prometheus"
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    depends_on:
+      - naming
+      - storage1
+      - storage2
+      - storage3
+      - storage4
+
+  grafana:
+    image: grafana/grafana:12.0.2
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: "admin"
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    depends_on:
+      - prometheus
+
 volumes:
   naming-data:
   storage1-data:
   storage2-data:
   storage3-data:
   storage4-data:
+  prometheus-data:
+  grafana-data:

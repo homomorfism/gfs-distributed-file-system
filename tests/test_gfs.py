@@ -6,6 +6,8 @@ Run with:  python tests/test_gfs.py
 import os
 import sys
 import tempfile
+import threading
+import time
 from concurrent import futures
 
 import grpc
@@ -33,6 +35,8 @@ class Cluster:
 
     def __init__(self, tmpdir, num_storage=4, replication=3):
         self.servers = []
+        self._heartbeat_threads = []
+        self._stop_heartbeats = threading.Event()
         store = MetadataStore(os.path.join(tmpdir, "meta.db"))
         self._store = store
         self.naming_servicer = NamingServicer(
@@ -53,6 +57,22 @@ class Cluster:
             # Register with the naming server (marks it alive).
             self.naming_servicer.RegisterStorage(
                 gfs_pb2.RegisterStorageRequest(address=addr), None)
+            # Keep the storage server alive via periodic heartbeats so the
+            # naming server's 15-second liveness timeout never expires during
+            # long-running tests or benchmarks.
+            t = threading.Thread(
+                target=self._heartbeat_loop, args=(addr, svc), daemon=True)
+            t.start()
+            self._heartbeat_threads.append(t)
+
+    def _heartbeat_loop(self, addr: str, svc: StorageServicer) -> None:
+        """Send periodic heartbeats so the naming server keeps this storage server
+        marked alive beyond HEARTBEAT_TIMEOUT."""
+        while not self._stop_heartbeats.wait(config.HEARTBEAT_INTERVAL):
+            self.naming_servicer.Heartbeat(
+                gfs_pb2.HeartbeatRequest(
+                    address=addr, chunk_ids=svc.held_chunk_ids()),
+                None)
 
     def client(self):
         return GFSClient(self.naming_addr)
@@ -69,9 +89,14 @@ class Cluster:
         return addr
 
     def shutdown(self):
+        self._stop_heartbeats.set()
         for s in self.servers:
             s.stop(0)
         self._store.close()
+
+    def close(self):
+        """Alias for shutdown() so benchmarks that call .close() don't crash."""
+        self.shutdown()
 
 
 def run_test(name, fn):

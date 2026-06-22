@@ -26,7 +26,20 @@ docker compose up --build -d
 docker compose ps
 ```
 
-Watch the naming server in a separate terminal:
+Wait for all storage servers to register with the naming server
+(before running any client commands that create files):
+
+```fish
+for i in (seq 1 10)
+    set live (docker compose logs naming 2>&1 | grep -c "registered")
+    test "$live" -ge 4 && break
+    echo "waiting for storage servers to register... ($live/4)"
+    sleep 2
+end
+docker compose logs naming | grep "registered"
+```
+
+Optionally follow the naming server logs in a separate terminal:
 
 ```fish
 docker compose logs -f naming
@@ -45,27 +58,60 @@ docker compose exec client python -m gfs.client ls
 
 ## 2. Simulate multiple clients
 
-Use parallel `docker compose exec -T client ...` commands. `-T` disables TTY
-allocation, which works better for background jobs.
+Use `docker compose run` with a single Python script that fans out writes
+via `ThreadPoolExecutor`. This avoids `docker compose exec` lock contention
+when running many commands in parallel.
 
 Create many files concurrently:
 
 ```fish
-for i in (seq 1 20)
-    docker compose exec -T client python -m gfs.client create /samples/hello.txt "hello-$i.txt" &
-end
-wait
+docker compose run --rm -T client python3 -c '
+from concurrent.futures import ThreadPoolExecutor
+from gfs.client.client import GFSClient, GFSError
+import os, time
+
+c = GFSClient(os.environ["NAMING_SERVER"])
+with open("/samples/hello.txt", "rb") as f:
+    data = f.read()
+
+# Wait until storage servers are registered (handles fresh naming-server
+# restarts where heartbeats have not arrived yet).
+for _ in range(15):
+    try:
+        c.create(".__warmup__", data[:1024])
+        c.delete(".__warmup__")
+        break
+    except GFSError as exc:
+        print(f"waiting for storage servers... ({exc})")
+        time.sleep(1)
+
+def upload(i):
+    c.create(f"hello-{i}.txt", data)
+    return i
+
+with ThreadPoolExecutor(max_workers=10) as pool:
+    for i in pool.map(upload, range(1, 21)):
+        print(f"created hello-{i}.txt")
+'
 ```
 
 Read them concurrently:
 
 ```fish
-mkdir -p /tmp/gfs-sim
+docker compose run --rm -T client python3 -c '
+from concurrent.futures import ThreadPoolExecutor
+from gfs.client.client import GFSClient
+import os
 
-for i in (seq 1 20)
-    docker compose exec -T client python -m gfs.client read "hello-$i.txt" > "/tmp/gfs-sim/hello-$i.txt" &
-end
-wait
+c = GFSClient(os.environ["NAMING_SERVER"])
+
+def download(i):
+    return i, c.read(f"hello-{i}.txt")
+
+with ThreadPoolExecutor(max_workers=10) as pool:
+    for i, content in pool.map(download, range(1, 21)):
+        print(f"read hello-{i}.txt ({len(content)} bytes)")
+'
 ```
 
 Check that the files exist in metadata:

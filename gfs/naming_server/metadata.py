@@ -168,21 +168,24 @@ class MetadataStore:
         """Return chunks for committed files, with their known replicas."""
         with self._lock:
             cur = self._conn.cursor()
-            chunk_rows = cur.execute(
-                "SELECT c.chunk_id, c.idx FROM chunks c "
+            rows = cur.execute(
+                "SELECT c.chunk_id, c.idx, r.address FROM chunks c "
                 "JOIN files f ON f.filename = c.filename "
+                "LEFT JOIN replicas r ON r.chunk_id = c.chunk_id "
                 "WHERE f.status = 'committed' "
                 "ORDER BY c.filename, c.idx"
             ).fetchall()
-            chunks: list[ChunkMeta] = []
-            for chunk_id, idx in chunk_rows:
-                locs = [r[0] for r in cur.execute(
-                    "SELECT address FROM replicas WHERE chunk_id = ?",
-                    (chunk_id,),
-                ).fetchall()]
-                chunks.append(ChunkMeta(chunk_id=chunk_id, index=idx,
-                                        locations=locs))
-            return chunks
+            # One query with a LEFT JOIN instead of N+1 per-chunk queries.
+            chunks_map: dict[str, ChunkMeta] = {}
+            ordered: list[str] = []
+            for chunk_id, idx, address in rows:
+                if chunk_id not in chunks_map:
+                    cm = ChunkMeta(chunk_id=chunk_id, index=idx, locations=[])
+                    chunks_map[chunk_id] = cm
+                    ordered.append(chunk_id)
+                if address is not None:
+                    chunks_map[chunk_id].locations.append(address)
+            return [chunks_map[cid] for cid in ordered]
 
     def all_chunk_locations(self, filename: str) -> list[tuple[str, list[str]]]:
         """Return [(chunk_id, [addresses])] for a file (used by delete)."""
