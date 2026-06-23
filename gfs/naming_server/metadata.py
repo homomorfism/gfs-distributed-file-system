@@ -155,17 +155,23 @@ class MetadataStore:
                 return None
             fm = FileMeta(filename=row[0], size=row[1], num_chunks=row[2],
                           status=row[3])
-            chunk_rows = cur.execute(
-                "SELECT chunk_id, idx FROM chunks WHERE filename = ? ORDER BY idx",
+            # Single LEFT JOIN instead of N+1 per-chunk queries for replicas.
+            rows = cur.execute(
+                "SELECT c.chunk_id, c.idx, r.address "
+                "FROM chunks c "
+                "LEFT JOIN replicas r ON r.chunk_id = c.chunk_id "
+                "WHERE c.filename = ? "
+                "ORDER BY c.idx",
                 (filename,),
             ).fetchall()
-            for chunk_id, idx in chunk_rows:
-                locs = [r[0] for r in cur.execute(
-                    "SELECT address FROM replicas WHERE chunk_id = ?",
-                    (chunk_id,),
-                ).fetchall()]
-                fm.chunks.append(ChunkMeta(chunk_id=chunk_id, index=idx,
-                                           locations=locs))
+            chunk_map: dict[str, ChunkMeta] = {}
+            for chunk_id, idx, address in rows:
+                if chunk_id not in chunk_map:
+                    cm = ChunkMeta(chunk_id=chunk_id, index=idx, locations=[])
+                    chunk_map[chunk_id] = cm
+                    fm.chunks.append(cm)
+                if address is not None:
+                    chunk_map[chunk_id].locations.append(address)
             return fm
 
     def list_files(self) -> list[FileMeta]:

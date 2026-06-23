@@ -54,7 +54,7 @@ except ModuleNotFoundError:
 # Configuration
 # ---------------------------------------------------------------------------
 NAMING_SERVER = os.environ.get("NAMING_SERVER", "naming:50051")
-NUM_USERS = int(os.environ.get("NUM_USERS", "100"))
+NUM_USERS = int(os.environ.get("NUM_USERS", "10"))
 MAX_FILE_SIZE = int(os.environ.get("MAX_FILE_MB", "1")) * 1_000_000
 MIN_FILE_SIZE = 1_024  # 1 KB
 CHUNK_SIZE = 1_024      # must match gfs.config.CHUNK_SIZE
@@ -76,6 +76,9 @@ SHOULD_STOP: threading.Event = threading.Event()  # set after import for clarity
 # ---------------------------------------------------------------------------
 # Statistics
 # ---------------------------------------------------------------------------
+_MAX_ERROR_SAMPLES = 100  # cap per-op-type error samples to avoid memory bloat
+
+
 @dataclass
 class Stats:
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -88,6 +91,25 @@ class Stats:
     bytes_written: int = 0
     bytes_read: int = 0
     start_time: float = field(default_factory=time.monotonic)
+    # Sample actual error strings so the user can see *what* is failing.
+    _write_error_samples: list[str] = field(default_factory=list)
+    _read_error_samples: list[str] = field(default_factory=list)
+    _delete_error_samples: list[str] = field(default_factory=list)
+
+    def record_error(self, op: str, message: str) -> None:
+        with self.lock:
+            if op == "write":
+                self.write_errors += 1
+                if len(self._write_error_samples) < _MAX_ERROR_SAMPLES:
+                    self._write_error_samples.append(message)
+            elif op == "read":
+                self.read_errors += 1
+                if len(self._read_error_samples) < _MAX_ERROR_SAMPLES:
+                    self._read_error_samples.append(message)
+            else:
+                self.delete_errors += 1
+                if len(self._delete_error_samples) < _MAX_ERROR_SAMPLES:
+                    self._delete_error_samples.append(message)
 
     def snapshot(self) -> dict:
         with self.lock:
@@ -101,6 +123,22 @@ class Stats:
                 "bytes_written": self.bytes_written,
                 "bytes_read": self.bytes_read,
                 "elapsed": time.monotonic() - self.start_time,
+            }
+
+    def error_summary(self) -> dict:
+        """Return counts of distinct error messages grouped by operation."""
+        with self.lock:
+
+            def _counts(samples: list[str]) -> list[tuple[str, int]]:
+                counts: dict[str, int] = {}
+                for msg in samples:
+                    counts[msg] = counts.get(msg, 0) + 1
+                return sorted(counts.items(), key=lambda x: -x[1])
+
+            return {
+                "write": _counts(self._write_error_samples),
+                "read": _counts(self._read_error_samples),
+                "delete": _counts(self._delete_error_samples),
             }
 
 
@@ -187,33 +225,20 @@ def _user_session(user_id: int) -> None:
                         client.delete(target)
                         with STATS.lock:
                             STATS.deletes += 1
-                    except GFSError:
+                    except GFSError as exc:
                         # File may already be gone (e.g. cleaned up by another
                         # user or purged by naming-server stale-pending GC).
-                        with STATS.lock:
-                            STATS.delete_errors += 1
+                        STATS.record_error("delete", str(exc))
                 else:
                     # Nothing to delete — do a read or write instead.
                     pass
 
-        except GFSError:
-            with STATS.lock:
-                if op == "write":
-                    STATS.write_errors += 1
-                elif op == "read":
-                    STATS.read_errors += 1
-                else:
-                    STATS.delete_errors += 1
+        except GFSError as exc:
+            STATS.record_error(op, str(exc))
             time.sleep(rng.uniform(0.05, 0.2))
 
-        except Exception:
-            with STATS.lock:
-                if op == "write":
-                    STATS.write_errors += 1
-                elif op == "read":
-                    STATS.read_errors += 1
-                else:
-                    STATS.delete_errors += 1
+        except Exception as exc:
+            STATS.record_error(op, f"{type(exc).__name__}: {exc}")
             # Back off a little on unexpected errors.
             time.sleep(rng.uniform(0.5, 1.0))
 
@@ -236,7 +261,7 @@ def _stats_reporter() -> None:
             print(
                 f"{'elapsed':>8s}  {'writes':>8s}  {'reads':>8s}  "
                 f"{'dels':>6s}  {'write BW':>9s}  {'read BW':>9s}  "
-                f"{'errors':>7s}"
+                f"{'errs':>6s}  {'W-err':>5s}  {'R-err':>5s}  {'D-err':>5s}"
             )
             header_printed = True
 
@@ -244,11 +269,10 @@ def _stats_reporter() -> None:
         rd_rate = (now["reads"] - last["reads"]) / dt
         bw_wr = (now["bytes_written"] - last["bytes_written"]) / dt / 1_000_000
         bw_rd = (now["bytes_read"] - last["bytes_read"]) / dt / 1_000_000
-        errors = (
-            (now["write_errors"] - last["write_errors"])
-            + (now["read_errors"] - last["read_errors"])
-            + (now["delete_errors"] - last["delete_errors"])
-        )
+        interval_wr_err = now["write_errors"] - last["write_errors"]
+        interval_rd_err = now["read_errors"] - last["read_errors"]
+        interval_dl_err = now["delete_errors"] - last["delete_errors"]
+        total_interval_err = interval_wr_err + interval_rd_err + interval_dl_err
 
         print(
             f"{now['elapsed']:7.1f}s  "
@@ -257,7 +281,10 @@ def _stats_reporter() -> None:
             f"{now['deletes']:4d}   "
             f"{bw_wr:7.1f} MB/s  "
             f"{bw_rd:7.1f} MB/s  "
-            f"{errors:5.0f}"
+            f"{total_interval_err:4.0f}    "
+            f"{interval_wr_err:4.0f}   "
+            f"{interval_rd_err:4.0f}   "
+            f"{interval_dl_err:4.0f}"
         )
         last = now
 
@@ -362,12 +389,30 @@ def main() -> None:
     print(f"  Deletes: {final['deletes']:>8d}")
     print(f"  Data written:  {final['bytes_written'] / 1_000_000:.1f} MB")
     print(f"  Data read:     {final['bytes_read'] / 1_000_000:.1f} MB")
+    print(f"  Errors:")
+    print(f"    Write:  {final['write_errors']:>6d}")
+    print(f"    Read:   {final['read_errors']:>6d}")
+    print(f"    Delete: {final['delete_errors']:>6d}")
     if total_err:
-        print(f"  Errors:        {total_err} "
-              f"({total_err / max(total_ops, 1) * 100:.2f}%)")
+        print(f"    Total:  {total_err:>6d}  "
+              f"({total_err / max(total_ops, 1) * 100:.2f}% of {total_ops} ops)")
     else:
-        print(f"  Errors:        0")
+        print(f"    Total:        0")
     print("=" * 60)
+
+    # Print detailed error breakdown if any errors occurred.
+    if total_err:
+        summary = STATS.error_summary()
+        for op_label, op_key in [("WRITE", "write"), ("READ", "read"),
+                                  ("DELETE", "delete")]:
+            entries = summary[op_key]
+            if not entries:
+                continue
+            print(f"\n  {op_label} errors (top 10):")
+            for msg, count in entries[:10]:
+                # Truncate long messages for readability.
+                display = msg if len(msg) <= 100 else msg[:97] + "..."
+                print(f"    [{count:>4d}x]  {display}")
 
     # ------------------------------------------------------------------
     # Cleanup

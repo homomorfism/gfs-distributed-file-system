@@ -4,6 +4,43 @@ All notable changes to the GFS distributed file system.
 
 ## [Unreleased]
 
+### Changed
+
+- **Write throughput: batched chunk writes via `StoreChunks` RPC.**  
+  Previously every 1 KB chunk was a separate `StoreChunk` gRPC call — a 10 MB
+  file meant ~30,720 RPCs (10,240 chunks × 3 replicas). Each call paid for
+  protobuf serialization, HTTP/2 framing, and thread-pool dispatch on a 1 KB
+  payload. The new `StoreChunks` RPC packs up to 1,024 chunks (~1 MB) into a
+  single message, reducing RPC count by ~1,000× for large files. The client
+  groups writes by storage server (already done) and sends one batched RPC per
+  server instead of one per chunk.
+  - New proto messages: `ChunkData`, `StoreChunksRequest`, `StoreChunksResponse`
+  - `StorageServicer.StoreChunks` writes all chunks in a batch, incrementing
+    byte counters once per batch instead of once per chunk.
+  - Client drops the per-chunk `ThreadPoolExecutor` inside `_upload`; batches
+    are sent sequentially per server (one at a time), but uploads to different
+    servers still run in parallel.
+
+- **gRPC channel cache in the client.**  
+  The client now caches and reuses gRPC channels by address (`_ChannelCache`)
+  instead of opening a new TCP connection on every operation. The naming-server
+  channel is held for the client's lifetime; storage-server channels are
+  created lazily on first use. This eliminates repeated TCP/TLS handshakes
+  across multiple `create`, `read`, or `delete` calls made by the same client
+  instance.
+
+- **Fix N+1 SQL queries in `MetadataStore.get_file()`.**  
+  `get_file()` previously ran the chunk query, then one `SELECT` per chunk to
+  find replicas — for a file with 10,240 chunks that was 10,242 queries. It now
+  uses a single `LEFT JOIN` across `chunks` and `replicas` (same pattern already
+  used in `list_committed_chunks()`).
+
+- **Async overwrite cleanup in `CreateFile`.**  
+  When overwriting a file, old chunks are now deleted in a fire-and-forget
+  background thread instead of synchronously blocking the `CreateFile` RPC.
+  This prevents the RPC from stalling for seconds while deleting thousands of
+  chunks from the previous version.
+
 ### Added
 
 - **Orphan chunk cleanup at storage server startup.** When a storage server

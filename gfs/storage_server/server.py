@@ -100,6 +100,44 @@ class StorageServicer(gfs_pb2_grpc.StorageServerServicer):
                 return gfs_pb2.StoreChunkResponse(ok=False, message=str(exc))
         return metrics.observe_rpc("storage", "StoreChunk", handle)
 
+    def StoreChunks(self, request, context):
+        def handle():
+            stored = 0
+            total_bytes = 0
+            for chunk in request.chunks:
+                path = self._path(chunk.chunk_id)
+                size = len(chunk.data)
+                try:
+                    try:
+                        old_size = os.path.getsize(path)
+                    except FileNotFoundError:
+                        old_size = -1
+
+                    tmp = path + ".tmp"
+                    with open(tmp, "wb") as fh:
+                        fh.write(chunk.data)
+                    os.replace(tmp, path)
+
+                    with self._counters_lock:
+                        if old_size == -1:
+                            self._chunk_count += 1
+                        self._total_bytes += size - max(old_size, 0)
+                    stored += 1
+                    total_bytes += size
+                except OSError as exc:
+                    logger.error("store chunk %s failed: %s", chunk.chunk_id, exc)
+                    return gfs_pb2.StoreChunksResponse(
+                        ok=False, message=f"chunk {chunk.chunk_id[:8]}…: {exc}",
+                        stored=stored)
+
+            if total_bytes:
+                metrics.STORAGE_CHUNK_BYTES_WRITTEN.labels(
+                    self._address).inc(total_bytes)
+            logger.info("stored %d chunks (%d bytes) via batch", stored, total_bytes)
+            return gfs_pb2.StoreChunksResponse(
+                ok=True, message=f"stored {stored}", stored=stored)
+        return metrics.observe_rpc("storage", "StoreChunks", handle)
+
     def GetChunk(self, request, context):
         def handle():
             path = self._path(request.chunk_id)

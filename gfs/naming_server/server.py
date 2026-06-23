@@ -209,16 +209,23 @@ class NamingServicer(gfs_pb2_grpc.NamingServerServicer):
                     ),
                 )
 
-            # Delete old chunks from storage servers before overwriting.
-            # Otherwise overwritten chunks become orphaned on disk (unreachable
-            # by metadata but never freed).
+            # Fire-and-forget old chunk deletion so overwrite doesn't block
+            # the CreateFile RPC.  Best-effort — orphaned chunks that survive
+            # are harmless and will be cleaned up by the storage server's
+            # startup scrub or the next overwrite of this file.
             old = self._store.get_file(request.filename)
             if old is not None:
-                for chunk in old.chunks:
-                    for addr in chunk.locations:
-                        _delete_chunk_on(addr, chunk.chunk_id)
-                logger.info("overwrite cleanup: %s (%d chunks purged)",
-                            request.filename, len(old.chunks))
+                old_chunks = [
+                    (addr, chunk.chunk_id)
+                    for chunk in old.chunks
+                    for addr in chunk.locations
+                ]
+                if old_chunks:
+                    threading.Thread(
+                        target=_delete_chunks_best_effort,
+                        args=(old_chunks, request.filename),
+                        daemon=True,
+                    ).start()
 
             placements = []
             chunks: list[ChunkMeta] = []
@@ -355,6 +362,22 @@ def _delete_chunk_on(address: str, chunk_id: str) -> bool:
         logger.warning("delete chunk %s on %s failed: %s", chunk_id, address,
                        exc.code())
         return False
+
+
+def _delete_chunks_best_effort(deletions: list[tuple[str, str]],
+                               filename: str) -> None:
+    """Delete a list of (address, chunk_id) pairs in background threads."""
+    failed = 0
+    for addr, chunk_id in deletions:
+        if not _delete_chunk_on(addr, chunk_id):
+            failed += 1
+    if failed:
+        logger.warning(
+            "overwrite cleanup '%s': %d/%d old-chunk deletes failed",
+            filename, failed, len(deletions))
+    else:
+        logger.info("overwrite cleanup '%s': %d old chunks purged",
+                    filename, len(deletions))
 
 
 def _replicate_chunk_on(target_address: str, chunk_id: str,
