@@ -86,8 +86,8 @@ The client groups all chunks destined for the same storage server into a single
 
 ## 2. Full read path
 
-The client requests chunk locations from the master, then reads each chunk
-**directly** from any available storage server.
+The client requests chunk locations from the master, then reads chunk batches
+**directly** from available storage servers.
 
 ```mermaid
 sequenceDiagram
@@ -104,27 +104,26 @@ sequenceDiagram
     M-->>C: GetFileResponse{ size, placements: [{index, chunk_id, locations}] }
     deactivate M
 
-    Note over C: For each chunk, tries replicas in order
+    Note over C: Groups chunk IDs by first live replica
 
-    par Parallel chunk reads (up to 16 threads)
-        C->>S1: GetChunk(chunk_id=abc)
+    par Parallel batched chunk reads
+        C->>S1: GetChunks([abc, def, ...])
         activate S1
-        S1->>S1: Reads DATA_DIR/abc.chunk
-        S1-->>C: data (1 KB)
+        S1->>S1: Reads DATA_DIR/*.chunk
+        S1-->>C: chunks [{abc, data}, {def, data}, ...]
         deactivate S1
     and
-        C->>S2: GetChunk(chunk_id=def)
+        C->>S2: GetChunks([ghi, jkl, ...])
         activate S2
-        S2->>S2: Reads DATA_DIR/def.chunk
-        S2-->>C: data (1 KB)
+        S2->>S2: Reads DATA_DIR/*.chunk
+        S2-->>C: chunks [{ghi, data}, {jkl, data}, ...]
         deactivate S2
-    and
-        C->>S2: GetChunk(chunk_id=ghi)
-        Note over C,S2: If S2 is unreachable — fallback to S3
-        C->>S3: GetChunk(chunk_id=ghi)
+
+        Note over C,S2: If S2 is unreachable or misses ghi — fallback to S3
+        C->>S3: GetChunks([ghi])
         activate S3
         S3->>S3: Reads DATA_DIR/ghi.chunk
-        S3-->>C: data (1 KB)
+        S3-->>C: chunks [{ghi, data}]
         deactivate S3
     end
 
@@ -138,16 +137,16 @@ sequenceDiagram
 | `GetFile` | Client → Master | `filename` |
 | `GetFileResponse` | Master → Client | `size`, `placements[]` (sorted by `index`), live replicas listed first |
 
-### client→chunkserver details (GetChunk)
+### client→chunkserver details (GetChunks)
 
 | RPC | Direction | Data |
 | --- | --- | --- |
-| `GetChunk` | Client → Storage | `chunk_id` |
-| `GetChunkResponse` | Storage → Client | `data` (bytes, up to 1 KB) |
+| `GetChunks` | Client → Storage | `chunk_ids[]` (batched up to 1024 chunks ≈ 1 MB) |
+| `GetChunksResponse` | Storage → Client | `chunks[]`, `missing_chunk_ids[]` |
 
-For each chunk the client iterates over `locations` in order and uses the first
-server that responds. If a server is unreachable — automatic fallback to the next
-replica.
+The client groups pending chunks by the next replica address and uses returned
+chunks immediately. If a server is unreachable or reports missing chunks, only
+those missing chunks are retried against the next replica.
 
 ---
 
@@ -195,7 +194,8 @@ sequenceDiagram
 | RPC | Client → Storage | Storage → Client | Purpose |
 | --- | --- | --- | --- |
 | `StoreChunks` | [{chunk_id, data}, …] | ok, stored=N | Batch chunk writes |
-| `GetChunk` | chunk_id | data | Single chunk read |
+| `GetChunks` | [chunk_id, …] | [{chunk_id, data}, …] | Batch chunk reads |
+| `GetChunk` | chunk_id | data | Single chunk read / compatibility |
 
 ---
 

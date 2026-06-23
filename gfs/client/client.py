@@ -143,33 +143,57 @@ class GFSClient:
             raise GFSError(resp.message)
 
         placements = sorted(resp.placements, key=lambda p: p.index)
+        return b"".join(self._fetch_chunks_batched(placements))
+
+    def _fetch_chunks_batched(self, placements) -> list[bytes]:
+        """Fetch chunks in storage-server batches, with replica fallback."""
         if not placements:
-            return b""
+            return []
 
-        def _fetch_one(placement):
-            data = self._fetch_chunk_any(placement)
-            if data is None:
+        by_chunk = {p.chunk_id: p for p in placements}
+        by_index = {p.chunk_id: p.index for p in placements}
+        parts: dict[str, bytes] = {}
+        tried: dict[str, set[str]] = {p.chunk_id: set() for p in placements}
+
+        while len(parts) < len(placements):
+            by_addr: dict[str, list[str]] = {}
+            for placement in placements:
+                if placement.chunk_id in parts:
+                    continue
+                addr = next(
+                    (candidate for candidate in placement.locations
+                     if candidate not in tried[placement.chunk_id]),
+                    None,
+                )
+                if addr is None:
+                    continue
+                tried[placement.chunk_id].add(addr)
+                by_addr.setdefault(addr, []).append(placement.chunk_id)
+
+            if not by_addr:
+                missing = [
+                    str(by_index[chunk_id])
+                    for chunk_id in by_chunk
+                    if chunk_id not in parts
+                ]
                 raise GFSError(
-                    f"chunk {placement.index} unavailable: all "
-                    f"{len(placement.locations)} replicas unreachable")
-            return placement.index, data
+                    "chunks unavailable after trying every replica: "
+                    f"{', '.join(missing[:10])}")
 
-        # Pipeline up to 16 concurrent chunk reads (HTTP/2 multiplexing).
-        with ThreadPoolExecutor(max_workers=min(16, len(placements))) as pool:
-            results = list(pool.map(_fetch_one, placements))
+            workers = min(16, len(by_addr))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                futs = {
+                    pool.submit(_get_chunks, self._channels.get(addr), batch): addr
+                    for addr, chunk_ids in by_addr.items()
+                    for batch in _chunk_id_batches(chunk_ids)
+                }
+                for fut in as_completed(futs):
+                    parts.update(fut.result())
 
-        # Reassemble in chunk-index order.
-        results.sort(key=lambda r: r[0])
-        return b"".join(data for _, data in results)
-
-    def _fetch_chunk_any(self, placement) -> bytes | None:
-        """Try each replica in turn; return the first that responds."""
-        for addr in placement.locations:
-            data = _get_chunk(
-                self._channels.get(addr), placement.chunk_id)
-            if data is not None:
-                return data
-        return None
+        return [
+            parts[placement.chunk_id]
+            for placement in sorted(placements, key=lambda p: p.index)
+        ]
 
     def delete(self, filename: str) -> str:
         resp = self._naming_stub.DeleteFile(
@@ -206,3 +230,18 @@ def _get_chunk(channel: grpc.Channel, chunk_id: str) -> bytes | None:
         return resp.data if resp.ok else None
     except grpc.RpcError:
         return None
+
+
+def _chunk_id_batches(chunk_ids: list[str]):
+    for i in range(0, len(chunk_ids), _BATCH_SIZE):
+        yield chunk_ids[i:i + _BATCH_SIZE]
+
+
+def _get_chunks(channel: grpc.Channel, chunk_ids: list[str]) -> dict[str, bytes]:
+    try:
+        stub = gfs_pb2_grpc.StorageServerStub(channel)
+        resp = stub.GetChunks(
+            gfs_pb2.GetChunksRequest(chunk_ids=chunk_ids), timeout=30)
+        return {chunk.chunk_id: chunk.data for chunk in resp.chunks}
+    except grpc.RpcError:
+        return {}
