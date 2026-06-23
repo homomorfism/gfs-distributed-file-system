@@ -2,6 +2,10 @@ __pycache__/
 *.pyc
 .venv/
 venv/
+node_modules/
+dist/
+.presentation-export/
+*.zip
 *_pb2.py
 *_pb2_grpc.py
 data/
