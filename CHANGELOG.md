@@ -66,6 +66,17 @@ All notable changes to the GFS distributed file system.
     are sent sequentially per server (one at a time), but uploads to different
     servers still run in parallel.
 
+- **Read throughput: batched chunk reads via `GetChunks` RPC.**
+  Large-file reads now mirror the write path: the client groups requested chunk
+  IDs by storage server and fetches up to 1,024 chunks per `GetChunks` RPC.
+  Missing chunks or failed servers still fall back to the next replica, but the
+  happy path avoids one RPC per 1 KB chunk.
+  - New proto messages: `GetChunksRequest`, `GetChunksResponse`
+  - `StorageServicer.GetChunks` reads a batch and increments read byte counters
+    once per batch.
+  - Client reassembles responses by chunk index and retries only missing chunks
+    against alternate replicas.
+
 - **gRPC channel cache in the client.**  
   The client now caches and reuses gRPC channels by address (`_ChannelCache`)
   instead of opening a new TCP connection on every operation. The naming-server

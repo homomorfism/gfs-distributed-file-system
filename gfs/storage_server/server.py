@@ -154,6 +154,35 @@ class StorageServicer(gfs_pb2_grpc.StorageServerServicer):
                 return gfs_pb2.GetChunkResponse(ok=False, message=str(exc))
         return metrics.observe_rpc("storage", "GetChunk", handle)
 
+    def GetChunks(self, request, context):
+        def handle():
+            chunks = []
+            missing = []
+            total_bytes = 0
+            for chunk_id in request.chunk_ids:
+                path = self._path(chunk_id)
+                try:
+                    with open(path, "rb") as fh:
+                        data = fh.read()
+                    chunks.append(gfs_pb2.ChunkData(
+                        chunk_id=chunk_id, data=data))
+                    total_bytes += len(data)
+                except FileNotFoundError:
+                    missing.append(chunk_id)
+                except OSError as exc:
+                    logger.warning("get chunk %s failed: %s", chunk_id, exc)
+                    missing.append(chunk_id)
+
+            if total_bytes:
+                metrics.STORAGE_CHUNK_BYTES_READ.labels(
+                    self._address).inc(total_bytes)
+            ok = not missing
+            message = "ok" if ok else f"{len(missing)} chunks missing"
+            return gfs_pb2.GetChunksResponse(
+                ok=ok, message=message, chunks=chunks,
+                missing_chunk_ids=missing)
+        return metrics.observe_rpc("storage", "GetChunks", handle)
+
     def DeleteChunk(self, request, context):
         def handle():
             path = self._path(request.chunk_id)

@@ -188,7 +188,7 @@ uv run python scripts/gen_proto.py
 uv run python tests/test_gfs.py
 ```
 
-Expected: `6/6 tests passed`.
+Expected: `7/7 tests passed`.
 
 ---
 

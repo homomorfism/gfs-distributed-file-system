@@ -77,8 +77,10 @@ service NamingService {
   rpc GetFileSize(Name)         returns (SizeReply);
 }
 service StorageService {
-  rpc PutChunk(ChunkData)       returns (Ack);    // bytes
+  rpc StoreChunk(ChunkData)     returns (Ack);    // bytes
+  rpc StoreChunks(ChunkBatch)   returns (Ack);
   rpc GetChunk(ChunkId)         returns (ChunkData);
+  rpc GetChunks(ChunkIdBatch)   returns (ChunkBatch);
   rpc DeleteChunk(ChunkId)      returns (Ack);
   rpc ReplicateChunk(CopyOrder) returns (Ack);    // pull chunk_id from a peer server (self-heal)
 }
@@ -91,16 +93,17 @@ service StorageService {
 **Phase 0 — Scaffolding.** Repo init, `requirements.txt` (`grpcio`, `grpcio-tools`),
 proto definition, codegen.
 
-**Phase 1 — Storage server.** `PutChunk/GetChunk/DeleteChunk` writing files to disk;
+**Phase 1 — Storage server.** `StoreChunk/StoreChunks/GetChunk/GetChunks/DeleteChunk` writing files to disk;
 `Register` + `Heartbeat` to master; in-memory chunk index. Unit-testable standalone.
 
 **Phase 2 — Naming server.** Server registry with liveness from heartbeats; metadata store
 (SQLite); placement (`AllocateChunks` returns chunk_ids + replica locations);
 `CreateFile/GetFileLocations/DeleteFile/GetFileSize`.
 
-**Phase 3 — Client.** Split text file into 1 KB chunks → ask master for placement → upload each
-chunk to R replicas → commit metadata. Read: get locations → fetch each chunk from any live
-replica (failover) → reassemble. Delete + size. CLI: `dfs create/read/delete/size`.
+**Phase 3 — Client.** Split text file into 1 KB chunks → ask master for placement → batch upload
+chunks to R replicas → commit metadata. Read: get locations → batch fetch chunks from live
+replicas with fallback for missing chunks → reassemble. Delete + size. CLI:
+`dfs create/read/delete/size`.
 
 **Phase 4 — Fault tolerance + self-healing.** Read failover across replicas; master skips dead
 servers in placement; **re-replication** — a background loop on the master scans `chunk → live

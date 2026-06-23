@@ -131,6 +131,16 @@ def test_size_no_transfer(cluster):
     assert num_chunks == 3, f"expected 3 chunks, got {num_chunks}"
 
 
+def test_one_megabyte_roundtrip(cluster):
+    client = cluster.client()
+    content = (b"0123456789abcdef" * (1024 * 1024 // 16))
+    client.create("one-mib.txt", content)
+    size, num_chunks = client.size("one-mib.txt")
+    assert size == 1024 * 1024, f"expected 1 MiB, got {size}"
+    assert num_chunks == 1024, f"expected 1024 chunks, got {num_chunks}"
+    assert client.read("one-mib.txt") == content
+
+
 def test_replication_survives_one_failure(cluster):
     client = cluster.client()
     content = ("replicate me " * 300).encode()
@@ -205,6 +215,8 @@ def main():
     results = []
     results.append(run_test("create_read_roundtrip", test_create_read_roundtrip))
     results.append(run_test("size_no_transfer", test_size_no_transfer))
+    results.append(run_test("one_megabyte_roundtrip",
+                            test_one_megabyte_roundtrip))
     results.append(run_test("replication_survives_one_failure",
                             test_replication_survives_one_failure))
     results.append(run_test("self_healing_restores_replication",

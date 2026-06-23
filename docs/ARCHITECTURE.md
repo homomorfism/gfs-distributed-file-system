@@ -33,7 +33,8 @@ Each stores only the chunks assigned to it — never the whole dataset — as pl
 files (`<chunk_id>.chunk`) under `DATA_DIR` on its local file system. This
 satisfies "chunk content stored in the file system, not in a database." On
 startup each registers with the naming server and then heartbeats every few
-seconds. It exposes `StoreChunk`, `GetChunk`, `DeleteChunk`, and
+seconds. It exposes `StoreChunk`, `StoreChunks`, `GetChunk`, `GetChunks`,
+`DeleteChunk`, and
 `ReplicateChunk` for server-to-server repair.
 
 ### Client
@@ -73,10 +74,12 @@ A crash between steps 2 and 4 leaves a `pending` row that is invisible to reads
 
 ### Read path
 1. `GetFile` → ordered chunk list + replica locations.
-2. The naming server returns live replica locations first. For each chunk the
-   client tries replicas **in order** and uses the first that responds — so a
-   single dead replica is transparent.
-3. Client concatenates the chunks and returns the original bytes.
+2. The naming server returns live replica locations first. The client groups
+   chunk IDs by storage server and fetches them with `GetChunks`, up to 1,024
+   chunks per RPC.
+3. If a batch misses chunks or a storage server is unreachable, the client
+   retries only those missing chunks against the next replica.
+4. Client concatenates the chunks and returns the original bytes.
 
 ### Self-healing path
 The naming server periodically scans committed chunks. If a chunk has fewer
