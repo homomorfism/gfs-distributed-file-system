@@ -119,13 +119,14 @@ class GFSClient:
                     raise GFSError(
                         f"batch write failed on {addr}: {resp.message}")
 
-        with ThreadPoolExecutor(max_workers=len(by_addr)) as pool:
-            futs = {
-                pool.submit(_upload, addr, writes): addr
-                for addr, writes in by_addr.items()
-            }
-            for fut in as_completed(futs):
-                fut.result()  # raises on first failure, cancels the rest
+        if by_addr:
+            with ThreadPoolExecutor(max_workers=len(by_addr)) as pool:
+                futs = {
+                    pool.submit(_upload, addr, writes): addr
+                    for addr, writes in by_addr.items()
+                }
+                for fut in as_completed(futs):
+                    fut.result()  # raises on first failure, cancels the rest
 
         commit = self._naming_stub.CommitFile(
             gfs_pb2.CommitFileRequest(filename=filename),
@@ -142,6 +143,8 @@ class GFSClient:
             raise GFSError(resp.message)
 
         placements = sorted(resp.placements, key=lambda p: p.index)
+        if not placements:
+            return b""
 
         def _fetch_one(placement):
             data = self._fetch_chunk_any(placement)
