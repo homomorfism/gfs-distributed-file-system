@@ -6,6 +6,51 @@ All notable changes to the GFS distributed file system.
 
 ### Changed
 
+- **Concurrency: naming server no longer flaps storage servers to "dead" under
+  load.** At ~100 concurrent users the naming server saturated and live storage
+  servers showed as unavailable in Grafana. Root cause was a chain of
+  serialization bottlenecks on the master; fixed as follows:
+  - **Per-thread read connections (WAL read concurrency).** `MetadataStore` used
+    a single SQLite connection behind one global `RLock`, so every read RPC
+    serialized behind every other read *and* write — discarding WAL's
+    one-writer/many-reader concurrency. Reads (`GetFile`, `ListFiles`,
+    `GetFileSize`, and the heal/metrics scans) now use a per-thread connection
+    and take no lock; only writes serialize, through a dedicated writer
+    connection guarded by a write lock.
+  - **Cheap metrics + healing (no full-table materialization).**
+    `_refresh_cluster_metrics()` and `heal_once()` previously materialized
+    *every* committed chunk into Python objects while holding the DB — seconds
+    of blocking per pass as the chunk count grew, which starved client RPCs and
+    heartbeats. Metrics now use SQL aggregates (`COUNT`/`SUM`); healing queries
+    only the under-replicated chunks (`MetadataStore.under_replicated_chunks`)
+    and short-circuits entirely when every known storage address is live
+    (`known_replica_addresses`) — the steady state does zero per-chunk work.
+  - **Larger, configurable gRPC worker pools.** Naming server 16 → 64 threads
+    (`GRPC_MAX_WORKERS`, default 64); storage servers 16 → 32. With the metadata
+    layer no longer hogging workers, cheap `Heartbeat`/`RegisterStorage` RPCs
+    always find a free thread, so liveness tracking stays accurate under load.
+  - **Indexes** on `chunks(filename)`, `replicas(chunk_id)`,
+    `replicas(address)`, and `files(status)` keep the heal/metrics aggregates
+    and per-file lookups off full table scans.
+
+- **Delete throughput: parallel chunk deletes + channel reuse.** `DeleteFile`
+  ran the per-replica `DeleteChunk` RPCs sequentially on a single worker thread,
+  each opening and closing a fresh TCP channel (thousands of handshakes for a
+  large file). It now deletes the metadata first (file disappears immediately),
+  then fans the chunk deletes out over a bounded pool (`DELETE_FANOUT`, default
+  32) using persistent, cached outbound channels shared with the self-healing
+  replication path.
+
+- **Quieter hot paths.** Per-1 KB-chunk `StoreChunk`/`DeleteChunk` logs and the
+  per-operation `CreateFile`/`CommitFile`/`DeleteFile` naming logs dropped from
+  INFO to DEBUG; at high op rates the logging itself was a throughput drag.
+
+- **Docker resource limits.** Each service now declares `deploy.resources`
+  limits/reservations so a load spike can't saturate the host (which itself
+  causes RPC/heartbeat timeouts). Tunable via env: `NAMING_CPUS` (default 2.0),
+  `NAMING_MEM` (1g), `STORAGE_CPUS` (1.0), `STORAGE_MEM` (512m), plus
+  `NAMING_WORKERS`/`STORAGE_WORKERS`.
+
 - **Write throughput: batched chunk writes via `StoreChunks` RPC.**  
   Previously every 1 KB chunk was a separate `StoreChunk` gRPC call — a 10 MB
   file meant ~30,720 RPCs (10,240 chunks × 3 replicas). Each call paid for

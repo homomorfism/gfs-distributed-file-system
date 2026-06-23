@@ -93,7 +93,7 @@ class StorageServicer(gfs_pb2_grpc.StorageServerServicer):
                         self._total_bytes += size - old_size
                 metrics.STORAGE_CHUNK_BYTES_WRITTEN.labels(
                     self._address).inc(size)
-                logger.info("stored chunk %s (%d bytes)", request.chunk_id, size)
+                logger.debug("stored chunk %s (%d bytes)", request.chunk_id, size)
                 return gfs_pb2.StoreChunkResponse(ok=True, message="stored")
             except OSError as exc:
                 logger.error("store chunk %s failed: %s", request.chunk_id, exc)
@@ -163,7 +163,7 @@ class StorageServicer(gfs_pb2_grpc.StorageServerServicer):
                 with self._counters_lock:
                     self._chunk_count -= 1
                     self._total_bytes -= old_size
-                logger.info("deleted chunk %s", request.chunk_id)
+                logger.debug("deleted chunk %s", request.chunk_id)
             except FileNotFoundError:
                 pass  # already gone; deletion is idempotent
             return gfs_pb2.DeleteChunkResponse(ok=True, message="deleted")
@@ -277,10 +277,12 @@ def serve() -> None:
     # Address other containers/clients use to reach this server.
     self_addr = os.environ.get("ADVERTISE_ADDR", f"localhost:{port}")
 
+    max_workers = int(os.environ.get("GRPC_MAX_WORKERS", "32"))
+
     metrics.start_metrics_server_from_env()
     servicer = StorageServicer(data_dir, self_addr)
     server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=16),
+        futures.ThreadPoolExecutor(max_workers=max_workers),
         options=[
             ("grpc.max_send_message_length", 256 * 1024 * 1024),
             ("grpc.max_receive_message_length", 256 * 1024 * 1024),

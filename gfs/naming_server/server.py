@@ -18,6 +18,7 @@ import threading
 import time
 import uuid
 from concurrent import futures
+from concurrent.futures import ThreadPoolExecutor
 
 import grpc
 
@@ -158,7 +159,18 @@ class NamingServicer(gfs_pb2_grpc.NamingServerServicer):
             if len(live_set) < self._replication:
                 return 0
 
-            for chunk in self._store.list_committed_chunks():
+            # Steady-state short-circuit: under-replication only arises when a
+            # storage server that holds committed chunks goes away.  If every
+            # address referenced by committed metadata is currently live, there
+            # is nothing to repair — skip the scan entirely.  (New chunks are
+            # always placed on R live servers, so a fully-live cluster is
+            # always fully replicated.)
+            if self._store.known_replica_addresses() <= live_set:
+                return 0
+
+            # Otherwise fetch *only* the chunks that are actually below target.
+            for chunk in self._store.under_replicated_chunks(
+                    live_set, self._replication):
                 known = list(dict.fromkeys(chunk.locations))
                 live_locations = [addr for addr in known if addr in live_set]
                 if len(live_locations) >= self._replication:
@@ -242,8 +254,8 @@ class NamingServicer(gfs_pb2_grpc.NamingServerServicer):
 
             self._store.create_pending(request.filename, request.size,
                                        request.num_chunks, chunks)
-            logger.info("create reserved: %s (%d chunks)", request.filename,
-                        request.num_chunks)
+            logger.debug("create reserved: %s (%d chunks)", request.filename,
+                         request.num_chunks)
             return gfs_pb2.CreateFileResponse(ok=True, message="reserved",
                                               placements=placements)
         return metrics.observe_rpc("naming", "CreateFile", handle)
@@ -252,7 +264,7 @@ class NamingServicer(gfs_pb2_grpc.NamingServerServicer):
         def handle():
             ok = self._store.commit_file(request.filename)
             msg = "committed" if ok else "unknown file"
-            logger.info("commit %s: %s", request.filename, msg)
+            logger.debug("commit %s: %s", request.filename, msg)
             return gfs_pb2.CommitFileResponse(ok=ok, message=msg)
         return metrics.observe_rpc("naming", "CommitFile", handle)
 
@@ -279,20 +291,24 @@ class NamingServicer(gfs_pb2_grpc.NamingServerServicer):
             if fm is None:
                 return gfs_pb2.DeleteFileResponse(ok=False, message="file not found")
 
-            # Best-effort: tell every replica to drop its chunk. A dead server
-            # simply misses the delete; its chunks are orphaned but unreachable
-            # (the file's metadata is gone), so they are harmless.
-            failures = 0
-            for chunk in fm.chunks:
-                for addr in chunk.locations:
-                    if not _delete_chunk_on(addr, chunk.chunk_id):
-                        failures += 1
-
+            # Drop metadata first so the file disappears for clients immediately
+            # and we don't hold the worker for the whole fan-out.
             self._store.delete_file(request.filename)
+
+            # Best-effort: tell every replica to drop its chunk, in parallel. A
+            # dead server simply misses the delete; its chunks are orphaned but
+            # unreachable (the file's metadata is gone), so they are harmless.
+            deletions = [
+                (addr, chunk.chunk_id)
+                for chunk in fm.chunks
+                for addr in chunk.locations
+            ]
+            failures = _delete_chunks_parallel(deletions)
+
             msg = "deleted"
             if failures:
                 msg = f"metadata deleted; {failures} replica deletes failed (orphaned)"
-            logger.info("delete %s: %s", request.filename, msg)
+            logger.debug("delete %s: %s", request.filename, msg)
             return gfs_pb2.DeleteFileResponse(ok=True, message=msg)
         return metrics.observe_rpc("naming", "DeleteFile", handle)
 
@@ -326,51 +342,81 @@ class NamingServicer(gfs_pb2_grpc.NamingServerServicer):
         return metrics.observe_rpc("naming", "ListExpectedChunks", handle)
 
     def _refresh_cluster_metrics(self) -> None:
+        """Publish cluster gauges using cheap SQL aggregates instead of
+        materialising every committed chunk in Python (which used to hold the
+        DB busy and starve client RPCs / heartbeats as the chunk count grew)."""
         live = set(self._registry.live_servers())
         metrics.NAMING_LIVE_STORAGE.set(len(live))
 
-        files_by_status = {"pending": 0, "committed": 0}
-        committed_bytes = 0
-        for file_meta in self._store.list_files():
-            files_by_status[file_meta.status] = (
-                files_by_status.get(file_meta.status, 0) + 1
-            )
-            if file_meta.status == "committed":
-                committed_bytes += file_meta.size
-        for status, count in files_by_status.items():
-            metrics.NAMING_FILES.labels(status).set(count)
-        metrics.NAMING_FILES_BYTES.set(committed_bytes)
+        files_by_status = self._store.count_files_by_status()
+        for status in ("pending", "committed"):
+            metrics.NAMING_FILES.labels(status).set(
+                files_by_status.get(status, 0))
+        metrics.NAMING_FILES_BYTES.set(self._store.committed_bytes())
 
-        committed_chunks = self._store.list_committed_chunks()
-        metrics.NAMING_COMMITTED_CHUNKS.set(len(committed_chunks))
-        under_replicated = 0
-        for chunk in committed_chunks:
-            live_replicas = {addr for addr in chunk.locations if addr in live}
-            if len(live_replicas) < self._replication:
-                under_replicated += 1
-        metrics.NAMING_UNDER_REPLICATED_CHUNKS.set(under_replicated)
+        metrics.NAMING_COMMITTED_CHUNKS.set(
+            self._store.count_committed_chunks())
+        metrics.NAMING_UNDER_REPLICATED_CHUNKS.set(
+            self._store.count_under_replicated(live, self._replication))
+
+
+# Maximum concurrent outbound chunk-delete RPCs when removing a file.  A 1 MB
+# file fans out to ~1000 chunks × R replicas; doing those sequentially on a
+# single worker thread (the old behaviour) blocked the worker for the whole
+# fan-out.  Reusing channels + a bounded pool keeps deletes fast and frees the
+# worker quickly.
+_DELETE_FANOUT = int(os.environ.get("DELETE_FANOUT", "32"))
+
+# Cache of outbound gRPC channels to storage servers, keyed by address.  The
+# naming server used to open (and immediately close) a fresh TCP connection for
+# every delete/replicate RPC — thousands of handshakes per large file.  A
+# persistent channel per storage server amortises that to one connection.
+_CHANNEL_OPTS = [
+    ("grpc.max_send_message_length", 256 * 1024 * 1024),
+    ("grpc.max_receive_message_length", 256 * 1024 * 1024),
+]
+_channels: dict[str, grpc.Channel] = {}
+_channels_lock = threading.Lock()
+
+
+def _storage_channel(address: str) -> grpc.Channel:
+    with _channels_lock:
+        ch = _channels.get(address)
+        if ch is None:
+            ch = grpc.insecure_channel(address, options=_CHANNEL_OPTS)
+            _channels[address] = ch
+        return ch
 
 
 def _delete_chunk_on(address: str, chunk_id: str) -> bool:
     try:
-        with grpc.insecure_channel(address) as channel:
-            stub = gfs_pb2_grpc.StorageServerStub(channel)
-            resp = stub.DeleteChunk(
-                gfs_pb2.DeleteChunkRequest(chunk_id=chunk_id), timeout=5)
-            return resp.ok
+        stub = gfs_pb2_grpc.StorageServerStub(_storage_channel(address))
+        resp = stub.DeleteChunk(
+            gfs_pb2.DeleteChunkRequest(chunk_id=chunk_id), timeout=5)
+        return resp.ok
     except grpc.RpcError as exc:  # server unreachable
         logger.warning("delete chunk %s on %s failed: %s", chunk_id, address,
                        exc.code())
         return False
 
 
+def _delete_chunks_parallel(deletions: list[tuple[str, str]]) -> int:
+    """Delete (address, chunk_id) pairs concurrently; return failure count."""
+    if not deletions:
+        return 0
+    workers = min(_DELETE_FANOUT, len(deletions))
+    failed = 0
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        for ok in pool.map(lambda d: _delete_chunk_on(d[0], d[1]), deletions):
+            if not ok:
+                failed += 1
+    return failed
+
+
 def _delete_chunks_best_effort(deletions: list[tuple[str, str]],
                                filename: str) -> None:
-    """Delete a list of (address, chunk_id) pairs in background threads."""
-    failed = 0
-    for addr, chunk_id in deletions:
-        if not _delete_chunk_on(addr, chunk_id):
-            failed += 1
+    """Delete a list of (address, chunk_id) pairs in parallel (background)."""
+    failed = _delete_chunks_parallel(deletions)
     if failed:
         logger.warning(
             "overwrite cleanup '%s': %d/%d old-chunk deletes failed",
@@ -383,14 +429,13 @@ def _delete_chunks_best_effort(deletions: list[tuple[str, str]],
 def _replicate_chunk_on(target_address: str, chunk_id: str,
                         source_address: str) -> bool:
     try:
-        with grpc.insecure_channel(target_address) as channel:
-            stub = gfs_pb2_grpc.StorageServerStub(channel)
-            resp = stub.ReplicateChunk(
-                gfs_pb2.ReplicateChunkRequest(
-                    chunk_id=chunk_id, source_address=source_address),
-                timeout=10,
-            )
-            return resp.ok
+        stub = gfs_pb2_grpc.StorageServerStub(_storage_channel(target_address))
+        resp = stub.ReplicateChunk(
+            gfs_pb2.ReplicateChunkRequest(
+                chunk_id=chunk_id, source_address=source_address),
+            timeout=10,
+        )
+        return resp.ok
     except grpc.RpcError as exc:
         logger.warning("replicate chunk %s to %s from %s failed: %s",
                        chunk_id, target_address, source_address, exc.code())
@@ -418,12 +463,17 @@ def serve() -> None:
     cleanup_max_age = float(os.environ.get(
         "CLEANUP_MAX_AGE", "60"))
 
+    # Plenty of worker threads so a burst of slow metadata RPCs can never
+    # starve the cheap membership RPCs (RegisterStorage/Heartbeat) — that
+    # starvation is what made live storage servers look "dead" under load.
+    max_workers = int(os.environ.get("GRPC_MAX_WORKERS", "64"))
+
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     metrics.start_metrics_server_from_env()
     store = MetadataStore(db_path)
 
     server = grpc.server(
-        futures.ThreadPoolExecutor(max_workers=16),
+        futures.ThreadPoolExecutor(max_workers=max_workers),
         options=[
             ("grpc.max_send_message_length", 256 * 1024 * 1024),
             ("grpc.max_receive_message_length", 256 * 1024 * 1024),
@@ -435,8 +485,9 @@ def serve() -> None:
     server.add_insecure_port(f"[::]:{port}")
     server.start()
     logger.info(
-        "naming server listening on :%d (replication=%d, heal_interval=%.1fs, db=%s)",
-        port, replication, heal_interval, db_path)
+        "naming server listening on :%d (replication=%d, heal_interval=%.1fs, "
+        "workers=%d, db=%s)",
+        port, replication, heal_interval, max_workers, db_path)
     server.wait_for_termination()
 
 

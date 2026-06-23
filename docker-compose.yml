@@ -17,10 +17,24 @@ services:
       REPLICATION_FACTOR: "3"
       METRICS_PORT: "8000"
       CLEANUP_MAX_AGE: "0"  # 0 = disable stale-pending cleanup
+      # gRPC worker threads: the naming server is the metadata bottleneck, so
+      # give it plenty of headroom (override with GRPC_MAX_WORKERS).
+      GRPC_MAX_WORKERS: "${NAMING_WORKERS:-64}"
     ports:
       - "50051:50051"   # exposed so a client on the host can connect too
     volumes:
       - naming-data:/data
+    # Cap utilisation so a load spike can't saturate the host (which itself
+    # causes RPC/heartbeat timeouts).  The naming server is the busiest node,
+    # so it gets the largest share.  Tune via env, e.g. NAMING_CPUS=3.
+    deploy:
+      resources:
+        limits:
+          cpus: "${NAMING_CPUS:-2.0}"
+          memory: "${NAMING_MEM:-1g}"
+        reservations:
+          cpus: "0.5"
+          memory: 256m
 
   storage1:
     image: gfs
@@ -32,10 +46,19 @@ services:
       NAMING_SERVER: "naming:50051"
       ADVERTISE_ADDR: "storage1:50061"
       METRICS_PORT: "8000"
+      GRPC_MAX_WORKERS: "${STORAGE_WORKERS:-32}"
     volumes:
       - storage1-data:/data
     depends_on:
       - naming
+    deploy:
+      resources:
+        limits:
+          cpus: "${STORAGE_CPUS:-1.0}"
+          memory: "${STORAGE_MEM:-512m}"
+        reservations:
+          cpus: "0.25"
+          memory: 128m
 
   storage2:
     image: gfs
@@ -47,10 +70,19 @@ services:
       NAMING_SERVER: "naming:50051"
       ADVERTISE_ADDR: "storage2:50061"
       METRICS_PORT: "8000"
+      GRPC_MAX_WORKERS: "${STORAGE_WORKERS:-32}"
     volumes:
       - storage2-data:/data
     depends_on:
       - naming
+    deploy:
+      resources:
+        limits:
+          cpus: "${STORAGE_CPUS:-1.0}"
+          memory: "${STORAGE_MEM:-512m}"
+        reservations:
+          cpus: "0.25"
+          memory: 128m
 
   storage3:
     image: gfs
@@ -62,10 +94,19 @@ services:
       NAMING_SERVER: "naming:50051"
       ADVERTISE_ADDR: "storage3:50061"
       METRICS_PORT: "8000"
+      GRPC_MAX_WORKERS: "${STORAGE_WORKERS:-32}"
     volumes:
       - storage3-data:/data
     depends_on:
       - naming
+    deploy:
+      resources:
+        limits:
+          cpus: "${STORAGE_CPUS:-1.0}"
+          memory: "${STORAGE_MEM:-512m}"
+        reservations:
+          cpus: "0.25"
+          memory: 128m
 
   storage4:
     image: gfs
@@ -77,10 +118,19 @@ services:
       NAMING_SERVER: "naming:50051"
       ADVERTISE_ADDR: "storage4:50061"
       METRICS_PORT: "8000"
+      GRPC_MAX_WORKERS: "${STORAGE_WORKERS:-32}"
     volumes:
       - storage4-data:/data
     depends_on:
       - naming
+    deploy:
+      resources:
+        limits:
+          cpus: "${STORAGE_CPUS:-1.0}"
+          memory: "${STORAGE_MEM:-512m}"
+        reservations:
+          cpus: "0.25"
+          memory: 128m
 
   # Helper container for running client commands inside the compose network.
   # It stays up (sleep) so you can `docker compose exec` or `run` against it.
