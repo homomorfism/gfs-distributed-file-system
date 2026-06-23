@@ -149,7 +149,7 @@ After **every** recovery step, run `fsck()` and additionally:
 ## 6. How to run
 
 - **Fast integration suite** (client replica-selection, master dead-server filtering, repair) —
-  `python tests/test_gfs.py`; fast, no containers.
+  `uv run pytest`; fast, no containers.
 - **Full failover suite** (S1–S8) — future `pytest` tests driving `docker-compose`, using
   `kill_server` / `partition` helpers; tagged `@pytest.mark.failover` so they can run separately
   from fast tests.

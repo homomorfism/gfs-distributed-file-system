@@ -185,10 +185,10 @@ and self-healing back to the target replication factor:
 
 ```bash
 uv run python scripts/gen_proto.py
-uv run python tests/test_gfs.py
+uv run pytest
 ```
 
-Expected: `7/7 tests passed`.
+Expected: all tests pass.
 
 ---
 
@@ -201,7 +201,7 @@ gfs/naming_server/         master: metadata store (SQLite) + gRPC service
 gfs/storage_server/        chunkserver: stores chunk files + heartbeats
 gfs/client/                client library + CLI
 scripts/gen_proto.py       generates the gRPC stubs (into gfs/_generated/)
-tests/test_gfs.py          end-to-end tests incl. fault tolerance
+tests/                     pytest integration, fault-tolerance, and persistence tests
 docker-compose.yml         1 naming + 4 storage + client helper
 Dockerfile                 single image for all roles
 docs/ARCHITECTURE.md       design + fault-tolerance analysis

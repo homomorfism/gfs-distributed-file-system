@@ -7,7 +7,7 @@ proto:          ## generate gRPC stubs from proto/gfs.proto
 	uv run python scripts/gen_proto.py
 
 test: proto     ## run the end-to-end tests in-process
-	uv run python tests/test_gfs.py
+	uv run pytest
 
 up:             ## build images and start the cluster
 	docker compose up --build -d
