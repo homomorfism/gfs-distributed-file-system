@@ -31,7 +31,7 @@ queries the master + scans storage disks):
 |---|---|
 | **I1 Replication** | every chunk_id is present on exactly R **live** storage servers |
 | **I2 Distinctness** | the R replicas of a chunk live on R distinct servers |
-| **I3 Metadata↔disk** | every `chunk_id` in master metadata has a file on each listed server; every chunk file on disk is referenced by metadata (no orphans) |
+| **I3 Metadata→disk** | every `chunk_id` in master metadata has a file on each listed server; unreferenced disk chunks are reported as reclaimable orphans |
 | **I4 Content** | `sha256(read(file)) == sha256(original)` for every test file |
 | **I5 Size** | `dfs size file == len(original)` without transferring chunks |
 | **I6 Liveness** | master's live-server set matches actually-running servers within one heartbeat interval |
@@ -64,15 +64,18 @@ Each scenario: **Setup → Inject → Assert during failure → Recover → Asse
 - **During:** `dfs read large.txt` succeeds; **I4** content matches; client transparently used a
   surviving replica (assert via client logs that it failed over, didn't just get lucky).
 - **Recover:** `start_server(X)`.
-- **After:** **I1–I6** hold; re-replication (if implemented) restores X's chunks **or** master
-  recognizes X's existing chunks as valid replicas again. No data movement should corrupt digests.
+- **After:** **I1, I2, I4, I5, I6** hold; re-replication restores the affected chunks to R live
+  replicas on the live spare. If X later returns with old chunk files that metadata no longer
+  references, those files are reclaimable orphans and must not affect reads.
 
 ### S2 — Read survives R−1 simultaneous failures
 - **Setup:** create `exact.txt`; identify the 3 servers holding chunk #1.
 - **Inject:** kill 2 of those 3 servers.
 - **During:** read still succeeds from the last replica; **I4/I5** hold.
-- **After (no recovery):** with re-replication ON, chunk #1 must climb back to R=3 on live servers
-  → assert **I1**. With re-replication OFF, document that the chunk is at replication 1 and at risk.
+- **After (no recovery):** read availability is preserved while one live replica remains, but the
+  4-node/R=3 cluster now has only 2 live servers, so it cannot climb back to 3 live replicas yet.
+  Assert the system reports the chunk as under-replicated and rejects new writes until at least
+  3 storage servers are live again. After one failed server returns, self-healing restores **I1**.
 
 ### S3 — Total loss of a chunk's replicas (unrecoverable boundary)
 - **Setup:** create `small.txt` (single chunk, 3 replicas).
@@ -124,8 +127,8 @@ Each scenario: **Setup → Inject → Assert during failure → Recover → Asse
 - **Inject:** kill_server(X) (holds some of its chunks); `dfs delete exact.txt`.
 - **During:** delete removes metadata + chunk files on the **live** servers.
 - **Recover:** start_server(X) — it comes back holding now-orphaned chunk files.
-- **After:** master must reconcile and delete X's orphan chunks (or a GC sweep does) → **I3**
-  holds (no orphans), and the file is gone from metadata. Re-issuing delete is a no-op, not an error.
+- **After:** the file is gone from metadata and re-issuing delete is a no-op, not an error. Chunks
+  left on X are reclaimable orphans unless a GC sweep is enabled.
 
 ---
 
@@ -138,17 +141,18 @@ After **every** recovery step, run `fsck()` and additionally:
 - **Re-replication bound:** if re-replication is implemented, assert it completes within a time
   bound (e.g. ≤ N heartbeat intervals) and that it created exactly the missing replicas — not
   extra copies (no over-replication beyond R).
-- **Disk accounting:** total chunk files on disk == `Σ chunks × R` for all files (within the
-  re-replication settling window).
+- **Disk accounting:** referenced chunk files on disk == `Σ chunks × R` for all committed files
+  (within the re-replication settling window); any extra files are reported as reclaimable orphans.
 
 ---
 
 ## 6. How to run
 
-- **Unit-level failover logic** (client replica-selection, master dead-server filtering) — pure
-  `pytest` with fakes; fast, no containers.
-- **Integration failover** (S1–S8) — `pytest` driving `docker-compose`, using `kill_server` /
-  `partition` helpers; tagged `@pytest.mark.failover` so they can run separately from fast tests.
+- **Fast integration suite** (client replica-selection, master dead-server filtering, repair) —
+  `python tests/test_gfs.py`; fast, no containers.
+- **Full failover suite** (S1–S8) — future `pytest` tests driving `docker-compose`, using
+  `kill_server` / `partition` helpers; tagged `@pytest.mark.failover` so they can run separately
+  from fast tests.
 - **Manual demo script** — `scripts/demo_failover.sh` walks S1, S3, and S6 with printed
   before/after `fsck` reports for the project presentation.
 

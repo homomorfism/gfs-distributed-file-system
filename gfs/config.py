@@ -6,12 +6,15 @@ CHUNK_SIZE = 1024
 
 # Default replication factor (each chunk lives on this many storage servers).
 # Must be > 1 per the requirements. Overridable via env on the naming server.
-DEFAULT_REPLICATION_FACTOR = 2
+DEFAULT_REPLICATION_FACTOR = 3
 
 # Seconds without a heartbeat before a storage server is considered dead.
 HEARTBEAT_TIMEOUT = 15
 # How often storage servers send heartbeats.
 HEARTBEAT_INTERVAL = 5
+# How often the naming server scans committed metadata for under-replicated
+# chunks and asks storage servers to repair them.
+HEAL_INTERVAL = 5
 
 
 def num_chunks_for_size(size: int) -> int:

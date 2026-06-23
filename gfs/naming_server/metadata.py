@@ -5,8 +5,11 @@ Only *metadata* lives here (file -> chunks -> replica locations). Chunk
 Persisting metadata to SQLite lets the naming server survive a restart with
 its file index intact.
 """
+from __future__ import annotations
+
 import sqlite3
 import threading
+import time
 from dataclasses import dataclass, field
 
 
@@ -31,7 +34,8 @@ CREATE TABLE IF NOT EXISTS files (
     filename   TEXT PRIMARY KEY,
     size       INTEGER NOT NULL,
     num_chunks INTEGER NOT NULL,
-    status     TEXT NOT NULL
+    status     TEXT NOT NULL,
+    created_at REAL NOT NULL
 );
 CREATE TABLE IF NOT EXISTS chunks (
     chunk_id  TEXT PRIMARY KEY,
@@ -54,9 +58,22 @@ class MetadataStore:
         # a single lock serializes all access for correctness.
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA foreign_keys = ON")
+        # WAL mode lets the background metrics/healing threads read while a
+        # large create_pending transaction is writing.
+        self._conn.execute("PRAGMA journal_mode = WAL")
+        # synchronous = NORMAL is safe in WAL mode and much faster for bulk
+        # inserts (the OS-level fsync is enough).
+        self._conn.execute("PRAGMA synchronous = NORMAL")
         self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(_SCHEMA)
+            # Migrate databases created before the created_at column was added.
+            cols = [r[1] for r in self._conn.execute(
+                "PRAGMA table_info(files)").fetchall()]
+            if "created_at" not in cols:
+                self._conn.execute(
+                    "ALTER TABLE files ADD COLUMN created_at REAL "
+                    "NOT NULL DEFAULT 0")
             self._conn.commit()
 
     def close(self) -> None:
@@ -70,20 +87,19 @@ class MetadataStore:
             cur = self._conn.cursor()
             cur.execute("DELETE FROM files WHERE filename = ?", (filename,))
             cur.execute(
-                "INSERT INTO files(filename, size, num_chunks, status) "
-                "VALUES (?, ?, ?, 'pending')",
-                (filename, size, num_chunks),
+                "INSERT INTO files(filename, size, num_chunks, status, created_at) "
+                "VALUES (?, ?, ?, 'pending', ?)",
+                (filename, size, num_chunks, time.time()),
             )
-            for ch in chunks:
-                cur.execute(
-                    "INSERT INTO chunks(chunk_id, filename, idx) VALUES (?, ?, ?)",
-                    (ch.chunk_id, filename, ch.index),
-                )
-                for addr in ch.locations:
-                    cur.execute(
-                        "INSERT INTO replicas(chunk_id, address) VALUES (?, ?)",
-                        (ch.chunk_id, addr),
-                    )
+            cur.executemany(
+                "INSERT INTO chunks(chunk_id, filename, idx) VALUES (?, ?, ?)",
+                ((ch.chunk_id, filename, ch.index) for ch in chunks),
+            )
+            cur.executemany(
+                "INSERT INTO replicas(chunk_id, address) VALUES (?, ?)",
+                ((ch.chunk_id, addr)
+                 for ch in chunks for addr in ch.locations),
+            )
             self._conn.commit()
 
     def commit_file(self, filename: str) -> bool:
@@ -103,6 +119,29 @@ class MetadataStore:
             self._conn.commit()
             return cur.rowcount > 0
 
+    def add_replica(self, chunk_id: str, address: str) -> bool:
+        """Record that `address` now stores `chunk_id`."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "INSERT OR IGNORE INTO replicas(chunk_id, address) "
+                "VALUES (?, ?)",
+                (chunk_id, address),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
+    def remove_replica(self, chunk_id: str, address: str) -> bool:
+        """Remove a stale replica location from metadata."""
+        with self._lock:
+            cur = self._conn.cursor()
+            cur.execute(
+                "DELETE FROM replicas WHERE chunk_id = ? AND address = ?",
+                (chunk_id, address),
+            )
+            self._conn.commit()
+            return cur.rowcount > 0
+
     # ---- reads ----
     def get_file(self, filename: str) -> FileMeta | None:
         with self._lock:
@@ -116,17 +155,23 @@ class MetadataStore:
                 return None
             fm = FileMeta(filename=row[0], size=row[1], num_chunks=row[2],
                           status=row[3])
-            chunk_rows = cur.execute(
-                "SELECT chunk_id, idx FROM chunks WHERE filename = ? ORDER BY idx",
+            # Single LEFT JOIN instead of N+1 per-chunk queries for replicas.
+            rows = cur.execute(
+                "SELECT c.chunk_id, c.idx, r.address "
+                "FROM chunks c "
+                "LEFT JOIN replicas r ON r.chunk_id = c.chunk_id "
+                "WHERE c.filename = ? "
+                "ORDER BY c.idx",
                 (filename,),
             ).fetchall()
-            for chunk_id, idx in chunk_rows:
-                locs = [r[0] for r in cur.execute(
-                    "SELECT address FROM replicas WHERE chunk_id = ?",
-                    (chunk_id,),
-                ).fetchall()]
-                fm.chunks.append(ChunkMeta(chunk_id=chunk_id, index=idx,
-                                           locations=locs))
+            chunk_map: dict[str, ChunkMeta] = {}
+            for chunk_id, idx, address in rows:
+                if chunk_id not in chunk_map:
+                    cm = ChunkMeta(chunk_id=chunk_id, index=idx, locations=[])
+                    chunk_map[chunk_id] = cm
+                    fm.chunks.append(cm)
+                if address is not None:
+                    chunk_map[chunk_id].locations.append(address)
             return fm
 
     def list_files(self) -> list[FileMeta]:
@@ -139,9 +184,62 @@ class MetadataStore:
             return [FileMeta(filename=r[0], size=r[1], num_chunks=r[2],
                              status=r[3]) for r in rows]
 
+    def list_committed_chunks(self) -> list[ChunkMeta]:
+        """Return chunks for committed files, with their known replicas."""
+        with self._lock:
+            cur = self._conn.cursor()
+            rows = cur.execute(
+                "SELECT c.chunk_id, c.idx, r.address FROM chunks c "
+                "JOIN files f ON f.filename = c.filename "
+                "LEFT JOIN replicas r ON r.chunk_id = c.chunk_id "
+                "WHERE f.status = 'committed' "
+                "ORDER BY c.filename, c.idx"
+            ).fetchall()
+            # One query with a LEFT JOIN instead of N+1 per-chunk queries.
+            chunks_map: dict[str, ChunkMeta] = {}
+            ordered: list[str] = []
+            for chunk_id, idx, address in rows:
+                if chunk_id not in chunks_map:
+                    cm = ChunkMeta(chunk_id=chunk_id, index=idx, locations=[])
+                    chunks_map[chunk_id] = cm
+                    ordered.append(chunk_id)
+                if address is not None:
+                    chunks_map[chunk_id].locations.append(address)
+            return [chunks_map[cid] for cid in ordered]
+
     def all_chunk_locations(self, filename: str) -> list[tuple[str, list[str]]]:
         """Return [(chunk_id, [addresses])] for a file (used by delete)."""
         fm = self.get_file(filename)
         if fm is None:
             return []
         return [(c.chunk_id, c.locations) for c in fm.chunks]
+
+    def list_chunk_ids_for(self, address: str) -> list[str]:
+        """Return all chunk IDs that metadata says should be stored at
+        `address`.  Used by storage servers at startup to find orphans."""
+        with self._lock:
+            rows = self._conn.execute(
+                "SELECT chunk_id FROM replicas WHERE address = ?",
+                (address,),
+            ).fetchall()
+            return [r[0] for r in rows]
+
+    def list_stale_pending(self, max_age_seconds: float) -> list[FileMeta]:
+        """Return pending files older than `max_age_seconds` with full chunk
+        location info so the caller can clean up storage-server chunks before
+        deleting the metadata."""
+        cutoff = time.time() - max_age_seconds
+        with self._lock:
+            cur = self._conn.cursor()
+            rows = cur.execute(
+                "SELECT filename FROM files "
+                "WHERE status = 'pending' AND created_at < ?",
+                (cutoff,),
+            ).fetchall()
+        # get_file acquires the lock internally; fine for this low-frequency op.
+        result: list[FileMeta] = []
+        for (filename,) in rows:
+            fm = self.get_file(filename)
+            if fm is not None:
+                result.append(fm)
+        return result

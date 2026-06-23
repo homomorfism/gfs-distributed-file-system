@@ -38,7 +38,7 @@ Companion to [`requirements.md`](./requirements.md).
 4. **Chunk size: fixed 1 KB** per spec.
 5. **Metadata persistence: SQLite** on the master. Chunk *content* stays on the file system.
    Survives master restart.
-6. **Placement: round-robin / least-loaded** across live servers; the R replicas of a chunk
+6. **Placement: round-robin** across live servers; the R replicas of a chunk
    are forced onto distinct servers.
 7. **Self-healing (re-replication):** when a storage server dies and a chunk drops below R live
    replicas, the master schedules a **server-to-server copy** from a surviving replica onto
@@ -50,15 +50,15 @@ Companion to [`requirements.md`](./requirements.md).
 ## 3. Repository layout
 
 ```
-distributed-file-system/
-├── proto/dfs.proto                # shared gRPC contract
-├── common/                        # generated stubs + shared utils
-├── naming_server/                 # master: metadata, placement, heartbeats
-├── storage_server/                # chunkserver: put/get/delete on FS
-├── client/                        # library + CLI (create/read/delete/size)
+gfs-distributed-file-system/
+├── proto/gfs.proto                # shared gRPC contract
+├── gfs/_generated/                # generated stubs (gitignored except package marker)
+├── gfs/naming_server/             # master: metadata, placement, heartbeats, healing
+├── gfs/storage_server/            # chunkserver: put/get/delete/replicate on FS
+├── gfs/client/                    # library + CLI (create/read/delete/size/list)
 ├── tests/                         # unit + integration + fault-injection
-├── docker/ docker-compose.yml
-├── docs/architecture.md           # design + fault-tolerance analysis
+├── docker-compose.yml
+├── docs/ARCHITECTURE.md           # design + fault-tolerance analysis
 └── README.md
 ```
 
@@ -88,7 +88,7 @@ service StorageService {
 
 ## 5. Implementation phases
 
-**Phase 0 — Scaffolding.** Repo init, `requirements.txt` (`grpcio`, `grpcio-tools`, `pytest`),
+**Phase 0 — Scaffolding.** Repo init, `requirements.txt` (`grpcio`, `grpcio-tools`),
 proto definition, codegen.
 
 **Phase 1 — Storage server.** `PutChunk/GetChunk/DeleteChunk` writing files to disk;
@@ -115,7 +115,7 @@ R) and avoids duplicate in-flight copies for the same chunk.
 
 ## 6. Testing plan
 
-### Unit (pytest)
+### Fast in-process tests
 - **Storage:** put→get round-trips bytes; delete removes file; get-missing errors.
 - **Naming:** placement returns R *distinct* live servers; dead servers excluded; metadata CRUD.
 - **Client:** chunking splits at exactly 1 KB boundaries; reassembly byte-exact. Cases: empty
@@ -130,7 +130,7 @@ R) and avoids duplicate in-flight copies for the same chunk.
 | Scenario | Expected | Verdict |
 |---|---|---|
 | Kill 1 storage server | Read still succeeds via replica failover; master re-replicates chunk to a live server back to R | recoverable + self-heals |
-| Kill R−1 servers holding a chunk | Chunk still readable; survivors re-replicate back to R on remaining live servers | demonstrates replication value + healing |
+| Kill R−1 servers holding a chunk | Chunk still readable if one replica remains; repair waits until at least R storage servers are live again | demonstrates replication value + capacity limit |
 | Kill all R replicas of a chunk | Chunk unavailable | unrecoverable while down (recoverable on restart) |
 | Kill master | Reads/writes fail (no placement/lookup) | single point of failure |
 | Restart master | Metadata survives (SQLite) | recoverable |

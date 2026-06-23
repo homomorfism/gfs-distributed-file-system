@@ -4,15 +4,18 @@ FROM python:3.12-slim
 
 WORKDIR /app
 
+COPY --from=ghcr.io/astral-sh/uv:0.11.6 /uv /uvx /bin/
+
 # Install dependencies first for better layer caching.
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml uv.lock .
+RUN uv sync --locked --no-dev
+ENV PATH="/app/.venv/bin:$PATH"
 
 # Copy source and generate the gRPC stubs (they are gitignored).
 COPY proto/ proto/
 COPY scripts/ scripts/
 COPY gfs/ gfs/
-RUN python scripts/gen_proto.py
+RUN uv run python scripts/gen_proto.py
 
 ENV PYTHONUNBUFFERED=1
 

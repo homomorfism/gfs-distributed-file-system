@@ -21,7 +21,7 @@ from concurrent import futures
 
 import grpc
 
-from gfs import config
+from gfs import config, metrics
 from gfs._generated import gfs_pb2, gfs_pb2_grpc
 from gfs.naming_server.metadata import ChunkMeta, MetadataStore
 
@@ -40,6 +40,10 @@ class _StorageRegistry:
     def mark_alive(self, address: str) -> None:
         with self._lock:
             self._last_seen[address] = self._monotonic()
+
+    def mark_dead(self, address: str) -> None:
+        with self._lock:
+            self._last_seen.pop(address, None)
 
     def live_servers(self) -> list[str]:
         now = self._monotonic()
@@ -61,110 +65,290 @@ class _StorageRegistry:
 
 
 class NamingServicer(gfs_pb2_grpc.NamingServerServicer):
-    def __init__(self, store: MetadataStore, replication_factor: int):
+    def __init__(self, store: MetadataStore, replication_factor: int,
+                 enable_healing: bool = True,
+                 heal_interval: float = config.HEAL_INTERVAL,
+                 metrics_interval: float = 10.0,
+                 cleanup_interval: float = 15.0,
+                 cleanup_max_age: float = 60.0):
         self._store = store
         self._replication = replication_factor
         self._registry = _StorageRegistry(time.monotonic)
+        self._heal_interval = heal_interval
+        self._cleanup_max_age = cleanup_max_age
+        self._stop_healing = threading.Event()
+        if enable_healing:
+            self._healer = threading.Thread(target=self._heal_loop, daemon=True)
+            self._healer.start()
+        # Background metrics refresh so expensive full-table scans don't block
+        # every RPC (see CHANGELOG.md).
+        self._metrics_interval = metrics_interval
+        self._metrics_thread = threading.Thread(
+            target=self._metrics_loop, daemon=True)
+        self._metrics_thread.start()
+        # Background cleanup of pending files left behind by interrupted writes.
+        if cleanup_max_age > 0:
+            self._cleanup_thread = threading.Thread(
+                target=self._cleanup_loop, args=(cleanup_interval,), daemon=True)
+            self._cleanup_thread.start()
 
     # ---------- membership ----------
     def RegisterStorage(self, request, context):
-        self._registry.mark_alive(request.address)
-        logger.info("storage server registered: %s", request.address)
-        return gfs_pb2.RegisterStorageResponse(ok=True, message="registered")
+        def handle():
+            self._registry.mark_alive(request.address)
+            logger.info("storage server registered: %s", request.address)
+            return gfs_pb2.RegisterStorageResponse(ok=True, message="registered")
+        return metrics.observe_rpc("naming", "RegisterStorage", handle)
 
     def Heartbeat(self, request, context):
-        self._registry.mark_alive(request.address)
-        return gfs_pb2.HeartbeatResponse(ok=True)
+        def handle():
+            self._registry.mark_alive(request.address)
+            return gfs_pb2.HeartbeatResponse(ok=True)
+        return metrics.observe_rpc("naming", "Heartbeat", handle)
+
+    # ---------- self-healing ----------
+    def _heal_loop(self) -> None:
+        while not self._stop_healing.wait(self._heal_interval):
+            try:
+                repaired = self.heal_once()
+                if repaired:
+                    logger.info("self-healing repaired %d replica(s)",
+                                repaired)
+            except Exception:  # keep the background repair loop alive
+                logger.exception("self-healing pass failed")
+
+    def _metrics_loop(self) -> None:
+        """Refresh Prometheus gauges on a timer to avoid scanning all chunks
+        on every RPC."""
+        while not self._stop_healing.wait(self._metrics_interval):
+            try:
+                self._refresh_cluster_metrics()
+            except Exception:
+                logger.exception("metrics refresh failed")
+
+    def _cleanup_loop(self, interval: float) -> None:
+        """Periodically garbage-collect pending files whose writes were
+        interrupted (client crashed mid-upload).  Metadata is removed first
+        so the file disappears immediately; chunk deletion on storage servers
+        is best-effort and happens after."""
+        while not self._stop_healing.wait(interval):
+            try:
+                stale = self._store.list_stale_pending(self._cleanup_max_age)
+                for fm in stale:
+                    self._store.delete_file(fm.filename)
+                    logger.info(
+                        "cleanup: removed stale pending file '%s' "
+                        "(%d chunks, age > %.0fs)",
+                        fm.filename, len(fm.chunks), self._cleanup_max_age)
+                    # Best-effort chunk cleanup — don't block the loop.
+                    for chunk in fm.chunks:
+                        for addr in chunk.locations:
+                            _delete_chunk_on(addr, chunk.chunk_id)
+            except Exception:
+                logger.exception("pending-file cleanup failed")
+
+    def heal_once(self) -> int:
+        """Repair committed chunks that are below the live replica target."""
+        start = time.perf_counter()
+        result = "ok"
+        live = self._registry.pick(len(self._registry.live_servers()))
+        live_set = set(live)
+        repaired = 0
+        try:
+            if len(live_set) < self._replication:
+                return 0
+
+            for chunk in self._store.list_committed_chunks():
+                known = list(dict.fromkeys(chunk.locations))
+                live_locations = [addr for addr in known if addr in live_set]
+                if len(live_locations) >= self._replication:
+                    continue
+                if not live_locations:
+                    logger.error("chunk %s has no live replica; cannot heal",
+                                 chunk.chunk_id)
+                    continue
+
+                stale_locations = [addr for addr in known if addr not in live_set]
+                candidates = [addr for addr in live if addr not in known]
+                while len(live_locations) < self._replication and candidates:
+                    target = candidates.pop(0)
+                    source = live_locations[0]
+                    if _replicate_chunk_on(target, chunk.chunk_id, source):
+                        self._store.add_replica(chunk.chunk_id, target)
+                        live_locations.append(target)
+                        repaired += 1
+                        metrics.NAMING_HEAL_REPAIRS.inc()
+                        # Keep metadata at exactly R replicas when replacing a
+                        # dead server; stale disk chunks become harmless orphans.
+                        if stale_locations:
+                            self._store.remove_replica(
+                                chunk.chunk_id, stale_locations.pop(0))
+                    else:
+                        logger.warning(
+                            "replication repair failed: chunk=%s source=%s target=%s",
+                            chunk.chunk_id, source, target)
+            return repaired
+        except Exception:
+            result = "error"
+            raise
+        finally:
+            metrics.NAMING_HEAL_PASSES.labels(result).inc()
+            metrics.NAMING_HEAL_DURATION.observe(time.perf_counter() - start)
+            self._refresh_cluster_metrics()
 
     # ---------- create ----------
     def CreateFile(self, request, context):
-        live = self._registry.live_servers()
-        if len(live) < self._replication:
-            return gfs_pb2.CreateFileResponse(
-                ok=False,
-                message=(
-                    f"need {self._replication} storage servers for replication, "
-                    f"only {len(live)} are live"
-                ),
-            )
-
-        placements = []
-        chunks: list[ChunkMeta] = []
-        for index in range(request.num_chunks):
-            locations = self._registry.pick(self._replication)
-            if len(locations) < self._replication:
+        def handle():
+            live = self._registry.live_servers()
+            if len(live) < self._replication:
                 return gfs_pb2.CreateFileResponse(
-                    ok=False, message="not enough live storage servers")
-            chunk_id = uuid.uuid4().hex
-            placements.append(gfs_pb2.ChunkPlacement(
-                index=index, chunk_id=chunk_id, locations=locations))
-            chunks.append(ChunkMeta(chunk_id=chunk_id, index=index,
-                                    locations=list(locations)))
+                    ok=False,
+                    message=(
+                        f"need {self._replication} storage servers for replication, "
+                        f"only {len(live)} are live"
+                    ),
+                )
 
-        self._store.create_pending(request.filename, request.size,
-                                   request.num_chunks, chunks)
-        logger.info("create reserved: %s (%d chunks)", request.filename,
-                    request.num_chunks)
-        return gfs_pb2.CreateFileResponse(ok=True, message="reserved",
-                                          placements=placements)
+            # Fire-and-forget old chunk deletion so overwrite doesn't block
+            # the CreateFile RPC.  Best-effort — orphaned chunks that survive
+            # are harmless and will be cleaned up by the storage server's
+            # startup scrub or the next overwrite of this file.
+            old = self._store.get_file(request.filename)
+            if old is not None:
+                old_chunks = [
+                    (addr, chunk.chunk_id)
+                    for chunk in old.chunks
+                    for addr in chunk.locations
+                ]
+                if old_chunks:
+                    threading.Thread(
+                        target=_delete_chunks_best_effort,
+                        args=(old_chunks, request.filename),
+                        daemon=True,
+                    ).start()
+
+            placements = []
+            chunks: list[ChunkMeta] = []
+            for index in range(request.num_chunks):
+                locations = self._registry.pick(self._replication)
+                if len(locations) < self._replication:
+                    return gfs_pb2.CreateFileResponse(
+                        ok=False, message="not enough live storage servers")
+                chunk_id = uuid.uuid4().hex
+                placements.append(gfs_pb2.ChunkPlacement(
+                    index=index, chunk_id=chunk_id, locations=locations))
+                chunks.append(ChunkMeta(chunk_id=chunk_id, index=index,
+                                        locations=list(locations)))
+
+            self._store.create_pending(request.filename, request.size,
+                                       request.num_chunks, chunks)
+            logger.info("create reserved: %s (%d chunks)", request.filename,
+                        request.num_chunks)
+            return gfs_pb2.CreateFileResponse(ok=True, message="reserved",
+                                              placements=placements)
+        return metrics.observe_rpc("naming", "CreateFile", handle)
 
     def CommitFile(self, request, context):
-        ok = self._store.commit_file(request.filename)
-        msg = "committed" if ok else "unknown file"
-        logger.info("commit %s: %s", request.filename, msg)
-        return gfs_pb2.CommitFileResponse(ok=ok, message=msg)
+        def handle():
+            ok = self._store.commit_file(request.filename)
+            msg = "committed" if ok else "unknown file"
+            logger.info("commit %s: %s", request.filename, msg)
+            return gfs_pb2.CommitFileResponse(ok=ok, message=msg)
+        return metrics.observe_rpc("naming", "CommitFile", handle)
 
     # ---------- read ----------
     def GetFile(self, request, context):
-        fm = self._store.get_file(request.filename)
-        if fm is None or fm.status != "committed":
-            return gfs_pb2.GetFileResponse(ok=False, message="file not found")
-        placements = [
-            gfs_pb2.ChunkPlacement(index=c.index, chunk_id=c.chunk_id,
-                                   locations=c.locations)
-            for c in fm.chunks
-        ]
-        return gfs_pb2.GetFileResponse(ok=True, message="ok", size=fm.size,
-                                       placements=placements)
+        def handle():
+            fm = self._store.get_file(request.filename)
+            if fm is None or fm.status != "committed":
+                return gfs_pb2.GetFileResponse(ok=False, message="file not found")
+            live = set(self._registry.live_servers())
+            placements = [
+                gfs_pb2.ChunkPlacement(index=c.index, chunk_id=c.chunk_id,
+                                       locations=_live_first(c.locations, live))
+                for c in fm.chunks
+            ]
+            return gfs_pb2.GetFileResponse(ok=True, message="ok", size=fm.size,
+                                           placements=placements)
+        return metrics.observe_rpc("naming", "GetFile", handle)
 
     # ---------- delete ----------
     def DeleteFile(self, request, context):
-        fm = self._store.get_file(request.filename)
-        if fm is None:
-            return gfs_pb2.DeleteFileResponse(ok=False, message="file not found")
+        def handle():
+            fm = self._store.get_file(request.filename)
+            if fm is None:
+                return gfs_pb2.DeleteFileResponse(ok=False, message="file not found")
 
-        # Best-effort: tell every replica to drop its chunk. A dead server
-        # simply misses the delete; its chunks are orphaned but unreachable
-        # (the file's metadata is gone), so they are harmless.
-        failures = 0
-        for chunk in fm.chunks:
-            for addr in chunk.locations:
-                if not _delete_chunk_on(addr, chunk.chunk_id):
-                    failures += 1
+            # Best-effort: tell every replica to drop its chunk. A dead server
+            # simply misses the delete; its chunks are orphaned but unreachable
+            # (the file's metadata is gone), so they are harmless.
+            failures = 0
+            for chunk in fm.chunks:
+                for addr in chunk.locations:
+                    if not _delete_chunk_on(addr, chunk.chunk_id):
+                        failures += 1
 
-        self._store.delete_file(request.filename)
-        msg = "deleted"
-        if failures:
-            msg = f"metadata deleted; {failures} replica deletes failed (orphaned)"
-        logger.info("delete %s: %s", request.filename, msg)
-        return gfs_pb2.DeleteFileResponse(ok=True, message=msg)
+            self._store.delete_file(request.filename)
+            msg = "deleted"
+            if failures:
+                msg = f"metadata deleted; {failures} replica deletes failed (orphaned)"
+            logger.info("delete %s: %s", request.filename, msg)
+            return gfs_pb2.DeleteFileResponse(ok=True, message=msg)
+        return metrics.observe_rpc("naming", "DeleteFile", handle)
 
     # ---------- size ----------
     def GetFileSize(self, request, context):
-        fm = self._store.get_file(request.filename)
-        if fm is None or fm.status != "committed":
-            return gfs_pb2.GetFileSizeResponse(ok=False, message="file not found")
-        return gfs_pb2.GetFileSizeResponse(ok=True, message="ok", size=fm.size,
-                                           num_chunks=fm.num_chunks)
+        def handle():
+            fm = self._store.get_file(request.filename)
+            if fm is None or fm.status != "committed":
+                return gfs_pb2.GetFileSizeResponse(
+                    ok=False, message="file not found")
+            return gfs_pb2.GetFileSizeResponse(
+                ok=True, message="ok", size=fm.size, num_chunks=fm.num_chunks)
+        return metrics.observe_rpc("naming", "GetFileSize", handle)
 
     # ---------- list ----------
     def ListFiles(self, request, context):
-        files = [
-            gfs_pb2.FileInfo(filename=f.filename, size=f.size,
-                             num_chunks=f.num_chunks, status=f.status)
-            for f in self._store.list_files()
-        ]
-        return gfs_pb2.ListFilesResponse(files=files)
+        def handle():
+            files = [
+                gfs_pb2.FileInfo(filename=f.filename, size=f.size,
+                                 num_chunks=f.num_chunks, status=f.status)
+                for f in self._store.list_files()
+            ]
+            return gfs_pb2.ListFilesResponse(files=files)
+        return metrics.observe_rpc("naming", "ListFiles", handle)
+
+    # ---------- orphan cleanup ----------
+    def ListExpectedChunks(self, request, context):
+        def handle():
+            ids = self._store.list_chunk_ids_for(request.address)
+            return gfs_pb2.ListExpectedChunksResponse(ok=True, chunk_ids=ids)
+        return metrics.observe_rpc("naming", "ListExpectedChunks", handle)
+
+    def _refresh_cluster_metrics(self) -> None:
+        live = set(self._registry.live_servers())
+        metrics.NAMING_LIVE_STORAGE.set(len(live))
+
+        files_by_status = {"pending": 0, "committed": 0}
+        committed_bytes = 0
+        for file_meta in self._store.list_files():
+            files_by_status[file_meta.status] = (
+                files_by_status.get(file_meta.status, 0) + 1
+            )
+            if file_meta.status == "committed":
+                committed_bytes += file_meta.size
+        for status, count in files_by_status.items():
+            metrics.NAMING_FILES.labels(status).set(count)
+        metrics.NAMING_FILES_BYTES.set(committed_bytes)
+
+        committed_chunks = self._store.list_committed_chunks()
+        metrics.NAMING_COMMITTED_CHUNKS.set(len(committed_chunks))
+        under_replicated = 0
+        for chunk in committed_chunks:
+            live_replicas = {addr for addr in chunk.locations if addr in live}
+            if len(live_replicas) < self._replication:
+                under_replicated += 1
+        metrics.NAMING_UNDER_REPLICATED_CHUNKS.set(under_replicated)
 
 
 def _delete_chunk_on(address: str, chunk_id: str) -> bool:
@@ -180,6 +364,46 @@ def _delete_chunk_on(address: str, chunk_id: str) -> bool:
         return False
 
 
+def _delete_chunks_best_effort(deletions: list[tuple[str, str]],
+                               filename: str) -> None:
+    """Delete a list of (address, chunk_id) pairs in background threads."""
+    failed = 0
+    for addr, chunk_id in deletions:
+        if not _delete_chunk_on(addr, chunk_id):
+            failed += 1
+    if failed:
+        logger.warning(
+            "overwrite cleanup '%s': %d/%d old-chunk deletes failed",
+            filename, failed, len(deletions))
+    else:
+        logger.info("overwrite cleanup '%s': %d old chunks purged",
+                    filename, len(deletions))
+
+
+def _replicate_chunk_on(target_address: str, chunk_id: str,
+                        source_address: str) -> bool:
+    try:
+        with grpc.insecure_channel(target_address) as channel:
+            stub = gfs_pb2_grpc.StorageServerStub(channel)
+            resp = stub.ReplicateChunk(
+                gfs_pb2.ReplicateChunkRequest(
+                    chunk_id=chunk_id, source_address=source_address),
+                timeout=10,
+            )
+            return resp.ok
+    except grpc.RpcError as exc:
+        logger.warning("replicate chunk %s to %s from %s failed: %s",
+                       chunk_id, target_address, source_address, exc.code())
+        return False
+
+
+def _live_first(locations: list[str], live: set[str]) -> list[str]:
+    return (
+        [addr for addr in locations if addr in live] +
+        [addr for addr in locations if addr not in live]
+    )
+
+
 def serve() -> None:
     logging.basicConfig(
         level=logging.INFO,
@@ -189,17 +413,30 @@ def serve() -> None:
     db_path = os.environ.get("METADATA_DB", "/data/metadata.db")
     replication = int(os.environ.get(
         "REPLICATION_FACTOR", config.DEFAULT_REPLICATION_FACTOR))
+    heal_interval = float(os.environ.get(
+        "HEAL_INTERVAL", config.HEAL_INTERVAL))
+    cleanup_max_age = float(os.environ.get(
+        "CLEANUP_MAX_AGE", "60"))
 
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
+    metrics.start_metrics_server_from_env()
     store = MetadataStore(db_path)
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    server = grpc.server(
+        futures.ThreadPoolExecutor(max_workers=16),
+        options=[
+            ("grpc.max_send_message_length", 256 * 1024 * 1024),
+            ("grpc.max_receive_message_length", 256 * 1024 * 1024),
+        ],
+    )
     gfs_pb2_grpc.add_NamingServerServicer_to_server(
-        NamingServicer(store, replication), server)
+        NamingServicer(store, replication, heal_interval=heal_interval,
+                       cleanup_max_age=cleanup_max_age), server)
     server.add_insecure_port(f"[::]:{port}")
     server.start()
-    logger.info("naming server listening on :%d (replication=%d, db=%s)",
-                port, replication, db_path)
+    logger.info(
+        "naming server listening on :%d (replication=%d, heal_interval=%.1fs, db=%s)",
+        port, replication, heal_interval, db_path)
     server.wait_for_termination()
 
 

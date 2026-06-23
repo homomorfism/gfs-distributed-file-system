@@ -23,6 +23,10 @@ service NamingServer {
   rpc DeleteFile(DeleteFileRequest) returns (DeleteFileResponse);
   rpc GetFileSize(GetFileSizeRequest) returns (GetFileSizeResponse);
   rpc ListFiles(ListFilesRequest) returns (ListFilesResponse);
+  // ListExpectedChunks returns the chunk IDs that a storage server should hold
+  // according to metadata.  Used by storage servers at startup to clean up
+  // orphan chunks left behind by self-healing replica migration.
+  rpc ListExpectedChunks(ListExpectedChunksRequest) returns (ListExpectedChunksResponse);
 }
 
 // =====================================================================
@@ -31,8 +35,12 @@ service NamingServer {
 // =====================================================================
 service StorageServer {
   rpc StoreChunk(StoreChunkRequest) returns (StoreChunkResponse);
+  rpc StoreChunks(StoreChunksRequest) returns (StoreChunksResponse);
   rpc GetChunk(GetChunkRequest) returns (GetChunkResponse);
   rpc DeleteChunk(DeleteChunkRequest) returns (DeleteChunkResponse);
+  // Naming server asks one storage server to repair replication by copying a
+  // chunk from another live storage server.
+  rpc ReplicateChunk(ReplicateChunkRequest) returns (ReplicateChunkResponse);
 }
 
 // ---------- membership ----------
@@ -132,6 +140,19 @@ message StoreChunkResponse {
   string message = 2;
 }
 
+message ChunkData {
+  string chunk_id = 1;
+  bytes data = 2;
+}
+message StoreChunksRequest {
+  repeated ChunkData chunks = 1;
+}
+message StoreChunksResponse {
+  bool ok = 1;
+  string message = 2;
+  int32 stored = 3; // number of chunks successfully stored
+}
+
 message GetChunkRequest {
   string chunk_id = 1;
 }
@@ -147,4 +168,22 @@ message DeleteChunkRequest {
 message DeleteChunkResponse {
   bool ok = 1;
   string message = 2;
+}
+
+message ReplicateChunkRequest {
+  string chunk_id = 1;
+  string source_address = 2;
+}
+message ReplicateChunkResponse {
+  bool ok = 1;
+  string message = 2;
+}
+
+// ---------- orphan cleanup ----------
+message ListExpectedChunksRequest {
+  string address = 1; // storage server address to query for
+}
+message ListExpectedChunksResponse {
+  bool ok = 1;
+  repeated string chunk_ids = 2;
 }

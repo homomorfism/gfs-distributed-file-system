@@ -4,10 +4,10 @@
 .PHONY: proto test up down logs clean
 
 proto:          ## generate gRPC stubs from proto/gfs.proto
-	python scripts/gen_proto.py
+	uv run python scripts/gen_proto.py
 
 test: proto     ## run the end-to-end tests in-process
-	python tests/test_gfs.py
+	uv run python tests/test_gfs.py
 
 up:             ## build images and start the cluster
 	docker compose up --build -d
