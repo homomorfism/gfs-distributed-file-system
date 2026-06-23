@@ -31,8 +31,11 @@ service NamingServer {
 // =====================================================================
 service StorageServer {
   rpc StoreChunk(StoreChunkRequest) returns (StoreChunkResponse);
+  rpc StoreChunks(StoreChunksRequest) returns (StoreChunksResponse);
   rpc GetChunk(GetChunkRequest) returns (GetChunkResponse);
+  rpc GetChunks(GetChunksRequest) returns (GetChunksResponse);
   rpc DeleteChunk(DeleteChunkRequest) returns (DeleteChunkResponse);
+  rpc DeleteChunks(DeleteChunksRequest) returns (DeleteChunksResponse);
   // Naming server asks one storage server to repair replication by copying a
   // chunk from another live storage server.
   rpc ReplicateChunk(ReplicateChunkRequest) returns (ReplicateChunkResponse);
@@ -135,6 +138,21 @@ message StoreChunkResponse {
   string message = 2;
 }
 
+message ChunkData {
+  string chunk_id = 1;
+  bytes data = 2;
+}
+
+message StoreChunksRequest {
+  repeated ChunkData chunks = 1;
+}
+message StoreChunksResponse {
+  bool ok = 1;
+  string message = 2;
+  int32 stored = 3;
+  repeated string failed_chunk_ids = 4;
+}
+
 message GetChunkRequest {
   string chunk_id = 1;
 }
@@ -144,12 +162,32 @@ message GetChunkResponse {
   bytes data = 3;
 }
 
+message GetChunksRequest {
+  repeated string chunk_ids = 1;
+}
+message GetChunksResponse {
+  bool ok = 1;
+  string message = 2;
+  repeated ChunkData chunks = 3;
+  repeated string missing_chunk_ids = 4;
+}
+
 message DeleteChunkRequest {
   string chunk_id = 1;
 }
 message DeleteChunkResponse {
   bool ok = 1;
   string message = 2;
+}
+
+message DeleteChunksRequest {
+  repeated string chunk_ids = 1;
+}
+message DeleteChunksResponse {
+  bool ok = 1;
+  string message = 2;
+  int32 deleted = 3;
+  repeated string failed_chunk_ids = 4;
 }
 
 message ReplicateChunkRequest {

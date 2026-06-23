@@ -56,6 +56,9 @@ class MetadataStore:
         # a single lock serializes all access for correctness.
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.execute("PRAGMA foreign_keys = ON")
+        self._conn.execute("PRAGMA journal_mode = WAL")
+        self._conn.execute("PRAGMA synchronous = NORMAL")
+        self._conn.execute("PRAGMA busy_timeout = 5000")
         self._lock = threading.RLock()
         with self._lock:
             self._conn.executescript(_SCHEMA)
@@ -76,16 +79,18 @@ class MetadataStore:
                 "VALUES (?, ?, ?, 'pending')",
                 (filename, size, num_chunks),
             )
-            for ch in chunks:
-                cur.execute(
-                    "INSERT INTO chunks(chunk_id, filename, idx) VALUES (?, ?, ?)",
-                    (ch.chunk_id, filename, ch.index),
-                )
-                for addr in ch.locations:
-                    cur.execute(
-                        "INSERT INTO replicas(chunk_id, address) VALUES (?, ?)",
-                        (ch.chunk_id, addr),
-                    )
+            cur.executemany(
+                "INSERT INTO chunks(chunk_id, filename, idx) VALUES (?, ?, ?)",
+                [(ch.chunk_id, filename, ch.index) for ch in chunks],
+            )
+            cur.executemany(
+                "INSERT INTO replicas(chunk_id, address) VALUES (?, ?)",
+                [
+                    (ch.chunk_id, addr)
+                    for ch in chunks
+                    for addr in ch.locations
+                ],
+            )
             self._conn.commit()
 
     def commit_file(self, filename: str) -> bool:

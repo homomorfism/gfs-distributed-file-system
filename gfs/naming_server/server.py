@@ -17,6 +17,7 @@ import os
 import threading
 import time
 import uuid
+from collections import defaultdict
 from concurrent import futures
 
 import grpc
@@ -197,11 +198,23 @@ class NamingServicer(gfs_pb2_grpc.NamingServerServicer):
         # Best-effort: tell every replica to drop its chunk. A dead server
         # simply misses the delete; its chunks are orphaned but unreachable
         # (the file's metadata is gone), so they are harmless.
-        failures = 0
+        by_address = defaultdict(list)
         for chunk in fm.chunks:
             for addr in chunk.locations:
-                if not _delete_chunk_on(addr, chunk.chunk_id):
-                    failures += 1
+                by_address[addr].append(chunk.chunk_id)
+
+        failures = 0
+        workers = min(config.DEFAULT_CLIENT_MAX_WORKERS,
+                      max(1, len(by_address)))
+        with futures.ThreadPoolExecutor(max_workers=workers) as pool:
+            jobs = {
+                pool.submit(_delete_chunks_on, addr, chunk_ids): (addr, chunk_ids)
+                for addr, chunk_ids in by_address.items()
+            }
+            for job in futures.as_completed(jobs):
+                _addr, chunk_ids = jobs[job]
+                if not job.result():
+                    failures += len(chunk_ids)
 
         self._store.delete_file(request.filename)
         msg = "deleted"
@@ -238,6 +251,18 @@ def _delete_chunk_on(address: str, chunk_id: str) -> bool:
     except grpc.RpcError as exc:  # server unreachable
         logger.warning("delete chunk %s on %s failed: %s", chunk_id, address,
                        exc.code())
+        return False
+
+
+def _delete_chunks_on(address: str, chunk_ids: list[str]) -> bool:
+    try:
+        with grpc.insecure_channel(address) as channel:
+            stub = gfs_pb2_grpc.StorageServerStub(channel)
+            resp = stub.DeleteChunks(
+                gfs_pb2.DeleteChunksRequest(chunk_ids=chunk_ids), timeout=10)
+            return resp.ok
+    except grpc.RpcError as exc:
+        logger.warning("delete chunks on %s failed: %s", address, exc.code())
         return False
 
 
@@ -280,14 +305,16 @@ def serve() -> None:
     os.makedirs(os.path.dirname(db_path) or ".", exist_ok=True)
     store = MetadataStore(db_path)
 
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    workers = int(os.environ.get("GRPC_MAX_WORKERS",
+                                 str(config.DEFAULT_GRPC_MAX_WORKERS)))
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=workers))
     gfs_pb2_grpc.add_NamingServerServicer_to_server(
         NamingServicer(store, replication, heal_interval=heal_interval), server)
     server.add_insecure_port(f"[::]:{port}")
     server.start()
     logger.info(
-        "naming server listening on :%d (replication=%d, heal_interval=%.1fs, db=%s)",
-        port, replication, heal_interval, db_path)
+        "naming server listening on :%d (replication=%d, heal_interval=%.1fs, db=%s, workers=%d)",
+        port, replication, heal_interval, db_path, workers)
     server.wait_for_termination()
 
 

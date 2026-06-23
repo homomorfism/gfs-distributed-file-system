@@ -16,6 +16,13 @@ HEARTBEAT_INTERVAL = 5
 # chunks and asks storage servers to repair them.
 HEAL_INTERVAL = 5
 
+# Production simulation settings: many clients generate thousands of small
+# chunk operations, so keep server pools and client fan-out bounded but larger
+# than the tiny demo defaults.
+DEFAULT_GRPC_MAX_WORKERS = 64
+DEFAULT_CLIENT_MAX_WORKERS = 16
+MAX_BULK_RPC_BYTES = 2 * 1024 * 1024
+
 
 def num_chunks_for_size(size: int) -> int:
     """Number of fixed-size chunks needed to hold `size` bytes."""

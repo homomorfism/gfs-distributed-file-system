@@ -48,6 +48,8 @@ fault-tolerance analysis.
   files under `DATA_DIR`. Register with the naming server and send heartbeats.
 - **Client** — a library (`gfs.client.GFSClient`) plus a CLI
   (`python -m gfs.client`) that hides chunking, placement and replication.
+  It batches chunk reads/writes by storage server so large files do not require
+  thousands of serial RPCs.
 
 Communication is **gRPC** (see [`proto/gfs.proto`](proto/gfs.proto)).
 
@@ -140,6 +142,7 @@ the internal compose network. A client running on the host can connect with
 | `METADATA_DB`        | `/data/metadata.db`  | SQLite metadata file (metadata only)     |
 | `REPLICATION_FACTOR` | `3`                  | replicas per chunk (must be > 1)         |
 | `HEAL_INTERVAL`      | `5`                  | seconds between self-healing scans       |
+| `GRPC_MAX_WORKERS`   | `64`                 | gRPC thread-pool size                    |
 
 **Storage server**
 
@@ -149,8 +152,10 @@ the internal compose network. A client running on the host can connect with
 | `DATA_DIR`       | `/data/chunks`   | where chunk **files** are stored              |
 | `NAMING_SERVER`  | `naming:50051`   | naming server address                         |
 | `ADVERTISE_ADDR` | `localhost:PORT` | address other peers use to reach this server  |
+| `GRPC_MAX_WORKERS` | `64`           | gRPC thread-pool size                         |
 
-**Client** — `NAMING_SERVER` (default `localhost:50051`) or `--naming host:port`.
+**Client** — `NAMING_SERVER` (default `localhost:50051`) or `--naming host:port`;
+`CLIENT_MAX_WORKERS` controls bounded parallel chunk fan-out (default `16`).
 
 ---
 
@@ -187,7 +192,16 @@ python scripts/gen_proto.py
 python tests/test_gfs.py
 ```
 
-Expected: `6/6 tests passed`.
+Expected: `7/7 tests passed`.
+
+To reproduce the production-style profile from the load test:
+
+```bash
+python scripts/load_simulation.py --users 100 --max-size 1048576
+```
+
+Expected: the script prints `PASS ... pending=0`. This runs 100 concurrent
+operations with 50% writes, 30% reads, 20% deletes and write files up to 1 MiB.
 
 ---
 
@@ -200,6 +214,7 @@ gfs/naming_server/         master: metadata store (SQLite) + gRPC service
 gfs/storage_server/        chunkserver: stores chunk files + heartbeats
 gfs/client/                client library + CLI
 scripts/gen_proto.py       generates the gRPC stubs (into gfs/_generated/)
+scripts/load_simulation.py 100-user local load simulation
 tests/test_gfs.py          end-to-end tests incl. fault tolerance
 docker-compose.yml         1 naming + 4 storage + client helper
 Dockerfile                 single image for all roles

@@ -33,7 +33,8 @@ Each stores only the chunks assigned to it — never the whole dataset — as pl
 files (`<chunk_id>.chunk`) under `DATA_DIR` on its local file system. This
 satisfies "chunk content stored in the file system, not in a database." On
 startup each registers with the naming server and then heartbeats every few
-seconds. It exposes `StoreChunk`, `GetChunk`, `DeleteChunk`, and
+seconds. It exposes single-chunk RPCs (`StoreChunk`, `GetChunk`,
+`DeleteChunk`), bulk RPCs (`StoreChunks`, `GetChunks`, `DeleteChunks`), and
 `ReplicateChunk` for server-to-server repair.
 
 ### Client
@@ -63,8 +64,11 @@ the naming server is never in the data path.
 1. Client splits the file into 1 KB chunks.
 2. `CreateFile` → naming server allocates chunk ids, picks replica locations,
    stores the metadata as **`pending`**, and returns the placement plan.
-3. Client uploads each chunk to **all** of its replica locations. If any replica
-   write fails, the client aborts and does **not** commit — so a file is never
+3. Client uploads each chunk to **all** of its replica locations, but batches
+   those uploads by storage server. A 1 MiB file still has 1024 logical chunks,
+   but the client sends a few bulk RPCs instead of thousands of serial RPCs.
+   If any replica write fails, the client aborts, asks the naming server to
+   delete the pending file, and does **not** commit — so a file is never
    half-replicated in the committed set.
 4. `CommitFile` flips the file to **`committed`**, making it readable.
 
@@ -73,9 +77,9 @@ A crash between steps 2 and 4 leaves a `pending` row that is invisible to reads
 
 ### Read path
 1. `GetFile` → ordered chunk list + replica locations.
-2. The naming server returns live replica locations first. For each chunk the
-   client tries replicas **in order** and uses the first that responds — so a
-   single dead replica is transparent.
+2. The naming server returns live replica locations first. The client groups
+   chunk fetches by storage server and uses `GetChunks`; if a batch misses a
+   chunk or a server is down, it retries that chunk against the next replica.
 3. Client concatenates the chunks and returns the original bytes.
 
 ### Self-healing path
@@ -88,10 +92,11 @@ replica in SQLite. When the repair replaces a dead server, stale metadata is
 removed so the committed layout stays at exactly R replicas.
 
 ### Delete path
-The naming server tells every replica to drop the chunk (idempotent), then
-removes the metadata. Replicas on a server that is down at delete time become
-**orphaned but unreachable** (the file's metadata is gone), so they waste space
-but cannot corrupt anything; a background sweeper could reclaim them.
+The naming server groups chunk deletes by storage server and calls
+`DeleteChunks`, then removes the metadata. Replicas on a server that is down at
+delete time become **orphaned but unreachable** (the file's metadata is gone),
+so they waste space but cannot corrupt anything; a background sweeper could
+reclaim them.
 
 ### Size path
 Answered purely from the `files` table — no chunk transfer, as required.
@@ -106,6 +111,8 @@ Answered purely from the `files` table — no chunk transfer, as required.
 | gRPC | Typed contract, multi-language clients, efficient. | Stubs must be generated (`scripts/gen_proto.py`). |
 | Client writes to all replicas synchronously | Guarantees the replication factor before commit. | Slower writes; a single down server blocks new writes to it (the master just avoids picking dead servers). |
 | Client reads directly from storage servers | Keeps the master off the data path → scalable. | Client must handle replica fallback (it does). |
+| Bulk storage RPCs | Keeps the required 1 KB chunks while avoiding thousands of serial RPCs for 1 MiB files under load. | Slightly larger per-RPC payloads; still below default gRPC limits for the assignment's 1 MiB files. |
+| Bounded parallelism | 100-user simulations can make progress without unbounded thread or channel creation. | Too-low limits reduce throughput; too-high limits can overload a small machine. |
 | SQLite for metadata | Durable across naming-server restarts; zero-ops. | Single-node; not a distributed store. |
 | Fixed tiny 1 KB chunk | Required; makes sharding/replication visible. | High per-chunk overhead vs. real GFS (64 MB); fine for a teaching system. |
 | Replication factor 3 (default) | Survives up to 2 simultaneous failures for a chunk while one replica remains; 4 storage servers leave a spare repair target after one failure. | Higher storage cost and slower writes than R=2. |

@@ -15,6 +15,7 @@ services:
       PORT: "50051"
       METADATA_DB: "/data/metadata.db"
       REPLICATION_FACTOR: "3"
+      GRPC_MAX_WORKERS: "64"
     ports:
       - "50051:50051"   # exposed so a client on the host can connect too
     volumes:
@@ -29,6 +30,7 @@ services:
       DATA_DIR: "/data/chunks"
       NAMING_SERVER: "naming:50051"
       ADVERTISE_ADDR: "storage1:50061"
+      GRPC_MAX_WORKERS: "64"
     volumes:
       - storage1-data:/data
     depends_on:
@@ -43,6 +45,7 @@ services:
       DATA_DIR: "/data/chunks"
       NAMING_SERVER: "naming:50051"
       ADVERTISE_ADDR: "storage2:50061"
+      GRPC_MAX_WORKERS: "64"
     volumes:
       - storage2-data:/data
     depends_on:
@@ -57,6 +60,7 @@ services:
       DATA_DIR: "/data/chunks"
       NAMING_SERVER: "naming:50051"
       ADVERTISE_ADDR: "storage3:50061"
+      GRPC_MAX_WORKERS: "64"
     volumes:
       - storage3-data:/data
     depends_on:
@@ -71,6 +75,7 @@ services:
       DATA_DIR: "/data/chunks"
       NAMING_SERVER: "naming:50051"
       ADVERTISE_ADDR: "storage4:50061"
+      GRPC_MAX_WORKERS: "64"
     volumes:
       - storage4-data:/data
     depends_on:
@@ -84,6 +89,7 @@ services:
     command: ["sleep", "infinity"]
     environment:
       NAMING_SERVER: "naming:50051"
+      CLIENT_MAX_WORKERS: "16"
     volumes:
       - ./samples:/samples
     depends_on:

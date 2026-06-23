@@ -14,6 +14,7 @@ import logging
 import os
 import threading
 import time
+import uuid
 from concurrent import futures
 
 import grpc
@@ -28,7 +29,6 @@ class StorageServicer(gfs_pb2_grpc.StorageServerServicer):
     def __init__(self, data_dir: str):
         self._data_dir = data_dir
         os.makedirs(data_dir, exist_ok=True)
-        self._lock = threading.Lock()
 
     def _path(self, chunk_id: str) -> str:
         # chunk_id is a uuid hex string -> safe as a filename.
@@ -39,20 +39,45 @@ class StorageServicer(gfs_pb2_grpc.StorageServerServicer):
                 if f.endswith(".chunk")]
 
     def StoreChunk(self, request, context):
-        path = self._path(request.chunk_id)
         try:
-            with self._lock:
-                # Atomic write: temp file then rename.
-                tmp = path + ".tmp"
-                with open(tmp, "wb") as fh:
-                    fh.write(request.data)
-                os.replace(tmp, path)
+            self._write_chunk(request.chunk_id, request.data)
             logger.info("stored chunk %s (%d bytes)", request.chunk_id,
                         len(request.data))
             return gfs_pb2.StoreChunkResponse(ok=True, message="stored")
         except OSError as exc:
             logger.error("store chunk %s failed: %s", request.chunk_id, exc)
             return gfs_pb2.StoreChunkResponse(ok=False, message=str(exc))
+
+    def StoreChunks(self, request, context):
+        failed = []
+        stored = 0
+        for chunk in request.chunks:
+            try:
+                self._write_chunk(chunk.chunk_id, chunk.data)
+                stored += 1
+            except OSError as exc:
+                logger.error("store chunk %s failed: %s", chunk.chunk_id, exc)
+                failed.append(chunk.chunk_id)
+        ok = not failed
+        message = "stored" if ok else f"{len(failed)} chunks failed"
+        return gfs_pb2.StoreChunksResponse(
+            ok=ok, message=message, stored=stored, failed_chunk_ids=failed)
+
+    def _write_chunk(self, chunk_id: str, data: bytes) -> None:
+        path = self._path(chunk_id)
+        # Atomic per-chunk write. The unique temp name avoids cross-thread
+        # collisions when many clients write to this storage server at once.
+        tmp = f"{path}.{uuid.uuid4().hex}.tmp"
+        try:
+            with open(tmp, "wb") as fh:
+                fh.write(data)
+            os.replace(tmp, path)
+        except OSError:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            raise
 
     def GetChunk(self, request, context):
         path = self._path(request.chunk_id)
@@ -65,6 +90,25 @@ class StorageServicer(gfs_pb2_grpc.StorageServerServicer):
         except OSError as exc:
             return gfs_pb2.GetChunkResponse(ok=False, message=str(exc))
 
+    def GetChunks(self, request, context):
+        chunks = []
+        missing = []
+        for chunk_id in request.chunk_ids:
+            path = self._path(chunk_id)
+            try:
+                with open(path, "rb") as fh:
+                    chunks.append(gfs_pb2.ChunkData(
+                        chunk_id=chunk_id, data=fh.read()))
+            except FileNotFoundError:
+                missing.append(chunk_id)
+            except OSError as exc:
+                logger.warning("get chunk %s failed: %s", chunk_id, exc)
+                missing.append(chunk_id)
+        ok = not missing
+        message = "ok" if ok else f"{len(missing)} chunks missing"
+        return gfs_pb2.GetChunksResponse(
+            ok=ok, message=message, chunks=chunks, missing_chunk_ids=missing)
+
     def DeleteChunk(self, request, context):
         path = self._path(request.chunk_id)
         try:
@@ -73,6 +117,25 @@ class StorageServicer(gfs_pb2_grpc.StorageServerServicer):
         except FileNotFoundError:
             pass  # already gone; deletion is idempotent
         return gfs_pb2.DeleteChunkResponse(ok=True, message="deleted")
+
+    def DeleteChunks(self, request, context):
+        failed = []
+        deleted = 0
+        for chunk_id in request.chunk_ids:
+            path = self._path(chunk_id)
+            try:
+                os.remove(path)
+                deleted += 1
+            except FileNotFoundError:
+                pass  # already gone; deletion is idempotent
+            except OSError as exc:
+                logger.warning("delete chunk %s failed: %s", chunk_id, exc)
+                failed.append(chunk_id)
+        ok = not failed
+        message = "deleted" if ok else f"{len(failed)} chunks failed"
+        return gfs_pb2.DeleteChunksResponse(
+            ok=ok, message=message, deleted=deleted,
+            failed_chunk_ids=failed)
 
     def ReplicateChunk(self, request, context):
         data = _get_chunk_from(request.source_address, request.chunk_id)
@@ -136,12 +199,15 @@ def serve() -> None:
     self_addr = os.environ.get("ADVERTISE_ADDR", f"localhost:{port}")
 
     servicer = StorageServicer(data_dir)
-    server = grpc.server(futures.ThreadPoolExecutor(max_workers=16))
+    workers = int(os.environ.get("GRPC_MAX_WORKERS",
+                                 str(config.DEFAULT_GRPC_MAX_WORKERS)))
+    server = grpc.server(futures.ThreadPoolExecutor(max_workers=workers))
     gfs_pb2_grpc.add_StorageServerServicer_to_server(servicer, server)
     server.add_insecure_port(f"[::]:{port}")
     server.start()
-    logger.info("storage server listening on :%d (advertise=%s, data=%s)",
-                port, self_addr, data_dir)
+    logger.info(
+        "storage server listening on :%d (advertise=%s, data=%s, workers=%d)",
+        port, self_addr, data_dir, workers)
 
     hb = threading.Thread(
         target=_heartbeat_loop,

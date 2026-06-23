@@ -22,8 +22,8 @@ Companion to [`requirements.md`](./requirements.md).
 | Component | Responsibility | Stores |
 |---|---|---|
 | **Naming server** (single) | Metadata authority. `filename → [chunk_id…]`, `chunk_id → [storage_server…]`, file size. Picks replica placement. Tracks live servers via heartbeats. | Metadata only (SQLite). **No chunk bytes.** |
-| **Storage server** (multiple) | Dumb chunk store. `put/get/delete` chunk by id. Registers with master, sends heartbeats. | Chunk bytes as files on disk (`/data/<chunk_id>`). |
-| **Client** | Library + CLI. Hides distribution. Splits/reassembles, talks to master for placement then directly to storage servers for bytes. | Nothing persistent. |
+| **Storage server** (multiple) | Chunk store with single-chunk and bulk `put/get/delete` RPCs. Registers with master, sends heartbeats. | Chunk bytes as files on disk (`/data/<chunk_id>`). |
+| **Client** | Library + CLI. Hides distribution. Splits/reassembles, talks to master for placement then directly to storage servers for batched bytes. | Nothing persistent. |
 
 ---
 
@@ -32,8 +32,9 @@ Companion to [`requirements.md`](./requirements.md).
 1. **Transport: gRPC everywhere.** Binary chunk transfer and metadata both over gRPC.
    Optional REST `/health` + `/status` on the master for ops/demo visibility only.
 2. **Replication topology: client-direct fan-out.** Master assigns R storage servers per
-   chunk; client uploads each chunk to all R replicas itself. Keeps storage servers simple,
-   avoids primary-forwarding complexity.
+   chunk; client uploads to all R replicas itself, grouped into bulk RPCs per storage server.
+   Keeps storage servers simple and avoids primary-forwarding complexity without creating
+   thousands of serial RPCs for 1 MiB files.
 3. **Replication factor R = 3** (configurable). Survives R−1 simultaneous storage-server failures.
 4. **Chunk size: fixed 1 KB** per spec.
 5. **Metadata persistence: SQLite** on the master. Chunk *content* stays on the file system.
@@ -56,7 +57,8 @@ gfs-distributed-file-system/
 ├── gfs/naming_server/             # master: metadata, placement, heartbeats, healing
 ├── gfs/storage_server/            # chunkserver: put/get/delete/replicate on FS
 ├── gfs/client/                    # library + CLI (create/read/delete/size/list)
-├── tests/                         # unit + integration + fault-injection
+├── tests/                         # fast in-process integration tests
+├── scripts/load_simulation.py      # 100-user local load profile
 ├── docker-compose.yml
 ├── docs/ARCHITECTURE.md           # design + fault-tolerance analysis
 └── README.md
@@ -77,9 +79,12 @@ service NamingService {
   rpc GetFileSize(Name)         returns (SizeReply);
 }
 service StorageService {
-  rpc PutChunk(ChunkData)       returns (Ack);    // bytes
+  rpc StoreChunk(ChunkData)     returns (Ack);    // bytes
+  rpc StoreChunks(ChunkDataBatch) returns (Ack);
   rpc GetChunk(ChunkId)         returns (ChunkData);
+  rpc GetChunks(ChunkIdBatch)   returns (ChunkDataBatch);
   rpc DeleteChunk(ChunkId)      returns (Ack);
+  rpc DeleteChunks(ChunkIdBatch) returns (Ack);
   rpc ReplicateChunk(CopyOrder) returns (Ack);    // pull chunk_id from a peer server (self-heal)
 }
 ```
@@ -91,16 +96,17 @@ service StorageService {
 **Phase 0 — Scaffolding.** Repo init, `requirements.txt` (`grpcio`, `grpcio-tools`),
 proto definition, codegen.
 
-**Phase 1 — Storage server.** `PutChunk/GetChunk/DeleteChunk` writing files to disk;
+**Phase 1 — Storage server.** Single-chunk and bulk put/get/delete writing files to disk;
 `Register` + `Heartbeat` to master; in-memory chunk index. Unit-testable standalone.
 
 **Phase 2 — Naming server.** Server registry with liveness from heartbeats; metadata store
 (SQLite); placement (`AllocateChunks` returns chunk_ids + replica locations);
 `CreateFile/GetFileLocations/DeleteFile/GetFileSize`.
 
-**Phase 3 — Client.** Split text file into 1 KB chunks → ask master for placement → upload each
-chunk to R replicas → commit metadata. Read: get locations → fetch each chunk from any live
-replica (failover) → reassemble. Delete + size. CLI: `dfs create/read/delete/size`.
+**Phase 3 — Client.** Split text file into 1 KB chunks → ask master for placement → batch upload
+chunks to R replicas by storage server → commit metadata. Read: get locations → fetch chunk
+batches from live replicas with fallback → reassemble. Delete + size. CLI:
+`dfs create/read/delete/size`.
 
 **Phase 4 — Fault tolerance + self-healing.** Read failover across replicas; master skips dead
 servers in placement; **re-replication** — a background loop on the master scans `chunk → live
