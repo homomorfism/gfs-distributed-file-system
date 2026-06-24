@@ -1,0 +1,30 @@
+# Keep the Docker build context small. The image only needs pyproject.toml,
+# uv.lock, proto/, scripts/ and gfs/ (see Dockerfile); everything below is
+# either irrelevant to the build or regenerated inside the image.
+
+# Version control / editor cruft
+.git
+.gitignore
+.dockerignore
+.DS_Store
+
+# Python caches and local virtualenvs
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# gRPC stubs are regenerated during the build
+*_pb2.py
+*_pb2_grpc.py
+
+# Local runtime data
+data/
+
+# Not needed to build or run the services
+docs/
+tests/
+monitoring/
+samples/
+*.zip
+*.bin
