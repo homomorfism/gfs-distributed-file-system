@@ -1,0 +1,937 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>GFS Clone — A Distributed File System</title>
+<style>
+  :root{
+    --bg:#fbfbfa;
+    --panel:#15171c;
+    --ink:#16181d;
+    --muted:#6b7280;
+    --line:#e7e6e3;
+    --accent:#5b6cff;
+    --accent-soft:#eef0ff;
+    --green:#28c08a;
+    --red:#ff5d5d;
+    --amber:#f5a524;
+    --radius:16px;
+    --maxw:1080px;
+    --mono:"SF Mono",ui-monospace,"JetBrains Mono",Menlo,Consolas,monospace;
+    --sans:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{
+    margin:0;background:var(--bg);color:var(--ink);
+    font-family:var(--sans);line-height:1.6;
+    -webkit-font-smoothing:antialiased;
+  }
+  a{color:inherit;text-decoration:none}
+  .wrap{max-width:var(--maxw);margin:0 auto;padding:0 24px}
+
+  /* ---------- nav ---------- */
+  nav{
+    position:sticky;top:0;z-index:50;
+    backdrop-filter:saturate(180%) blur(12px);
+    background:rgba(251,251,250,.78);
+    border-bottom:1px solid var(--line);
+  }
+  nav .wrap{display:flex;align-items:center;justify-content:space-between;height:60px}
+  .brand{display:flex;align-items:center;gap:10px;font-weight:700;letter-spacing:-.02em}
+  .brand .dot{width:11px;height:11px;border-radius:50%;background:var(--accent);
+    box-shadow:0 0 0 4px var(--accent-soft)}
+  .nav-links{display:flex;gap:28px;font-size:14px;color:var(--muted)}
+  .nav-links a{transition:color .2s}
+  .nav-links a:hover{color:var(--ink)}
+  @media(max-width:720px){.nav-links{display:none}}
+
+  /* ---------- hero ---------- */
+  header.hero{padding:96px 0 64px;text-align:center}
+  .eyebrow{font-family:var(--mono);font-size:12px;letter-spacing:.18em;
+    text-transform:uppercase;color:var(--accent);margin-bottom:20px}
+  h1{font-size:clamp(38px,6vw,68px);line-height:1.04;letter-spacing:-.035em;
+    margin:0 0 22px;font-weight:760}
+  h1 .grad{background:linear-gradient(100deg,#5b6cff,#28c08a);
+    -webkit-background-clip:text;background-clip:text;color:transparent}
+  .lede{font-size:clamp(17px,2.2vw,20px);color:var(--muted);
+    max-width:660px;margin:0 auto 36px}
+  .chips{display:flex;flex-wrap:wrap;gap:10px;justify-content:center}
+  .chip{font-family:var(--mono);font-size:12.5px;color:var(--ink);
+    background:#fff;border:1px solid var(--line);border-radius:999px;
+    padding:8px 14px;display:inline-flex;gap:8px;align-items:center}
+  .chip b{color:var(--accent)}
+
+  /* ---------- sections ---------- */
+  section{padding:72px 0;border-top:1px solid var(--line)}
+  .kicker{font-family:var(--mono);font-size:12px;letter-spacing:.16em;
+    text-transform:uppercase;color:var(--muted);margin:0 0 12px}
+  h2{font-size:clamp(28px,4vw,40px);letter-spacing:-.03em;margin:0 0 18px;font-weight:720}
+  .section-lede{color:var(--muted);max-width:640px;font-size:17px;margin:0 0 8px}
+
+  /* ---------- architecture grid ---------- */
+  .grid{display:grid;gap:18px}
+  .cols-3{grid-template-columns:repeat(3,1fr)}
+  .cols-2{grid-template-columns:repeat(2,1fr)}
+  @media(max-width:860px){.cols-3,.cols-2{grid-template-columns:1fr}}
+  .card{background:#fff;border:1px solid var(--line);border-radius:var(--radius);
+    padding:24px;transition:transform .25s ease,box-shadow .25s ease}
+  .card:hover{transform:translateY(-3px);box-shadow:0 18px 40px -24px rgba(20,24,40,.35)}
+  .card h3{margin:0 0 8px;font-size:18px;letter-spacing:-.01em}
+  .card p{margin:0;color:var(--muted);font-size:14.5px}
+  .card .ic{width:40px;height:40px;border-radius:11px;background:var(--accent-soft);
+    display:grid;place-items:center;margin-bottom:16px;color:var(--accent);font-size:20px}
+
+  /* ---------- simulator panel (light) ---------- */
+  .stage{background:#fff;border:1px solid var(--line);border-radius:24px;padding:26px;
+    box-shadow:0 30px 70px -42px rgba(20,24,60,.28);color:var(--ink);margin-top:28px}
+  .stage-head{display:flex;align-items:center;justify-content:space-between;
+    gap:16px;flex-wrap:wrap;margin-bottom:16px;padding-bottom:16px;border-bottom:1px solid var(--line)}
+  .stage-title{display:flex;align-items:center;gap:10px;font-weight:650;font-size:15px;color:var(--ink)}
+  .live{display:inline-flex;align-items:center;gap:7px;font-family:var(--mono);
+    font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.12em}
+  .live .pip{width:8px;height:8px;border-radius:50%;background:var(--green);
+    animation:blink 1.6s infinite}
+  @keyframes blink{0%,100%{opacity:1}50%{opacity:.25}}
+
+  .stage-body{display:grid;grid-template-columns:1.65fr .9fr;gap:20px}
+  @media(max-width:900px){.stage-body{grid-template-columns:1fr}}
+  .diagram{background:linear-gradient(180deg,#fcfdff,#f1f4f9);
+    border:1px solid var(--line);border-radius:16px;overflow:hidden}
+  svg{display:block;width:100%;height:auto}
+
+  /* nodes */
+  .node rect{transition:all .35s ease;filter:drop-shadow(0 4px 10px rgba(20,24,50,.06))}
+  .node .nlabel{font-family:var(--sans);font-weight:650;fill:var(--ink);font-size:16px}
+  .node .nsub{font-family:var(--mono);fill:var(--muted);font-size:11.5px}
+  .node.dead rect{stroke:var(--red);fill:#fff1f1;stroke-dasharray:5 4}
+  .node.dead .nlabel{fill:#d23b3b}
+  .node.dead .nsub{fill:#c58589}
+  .node.heal rect{stroke:var(--green);stroke-width:2.6}
+  .link{stroke-linecap:round;fill:none}
+  .badge{font-family:var(--mono);font-size:10px;fill:var(--muted)}
+
+  /* log + controls */
+  .side{display:flex;flex-direction:column;gap:16px;min-height:0}
+  .controls{display:flex;flex-direction:column;gap:14px}
+  .ctl-group .gl{font-family:var(--mono);font-size:10.5px;letter-spacing:.14em;
+    text-transform:uppercase;color:var(--muted);margin-bottom:9px}
+  .btns{display:flex;flex-wrap:wrap;gap:9px}
+  button.op{appearance:none;border:1px solid var(--line);background:#fff;color:var(--ink);
+    font-family:var(--sans);font-size:13.5px;font-weight:600;padding:10px 15px;
+    border-radius:11px;cursor:pointer;transition:all .18s ease;display:inline-flex;gap:8px;align-items:center;
+    box-shadow:0 1px 2px rgba(20,24,40,.05)}
+  button.op:hover:not(:disabled){border-color:var(--accent);background:var(--accent-soft);
+    color:var(--accent);transform:translateY(-1px);box-shadow:0 8px 18px -10px rgba(91,108,255,.55)}
+  button.op:disabled{opacity:.45;cursor:not-allowed}
+  button.op.danger:hover:not(:disabled){border-color:var(--red);background:#fff1f1;color:#d23b3b;
+    box-shadow:0 8px 18px -10px rgba(255,93,93,.55)}
+  button.op.good:hover:not(:disabled){border-color:var(--green);background:#ecfaf4;color:#159b6e;
+    box-shadow:0 8px 18px -10px rgba(40,192,138,.55)}
+  button.op .k{width:8px;height:8px;border-radius:50%}
+  .k.blue{background:var(--accent)}.k.greenk{background:var(--green)}.k.redk{background:var(--red)}.k.amberk{background:var(--amber)}
+
+  .log{background:#f7f8fb;border:1px solid var(--line);border-radius:14px;
+    padding:15px;font-family:var(--mono);font-size:12px;line-height:1.7;
+    height:330px;overflow-y:auto;color:#4b5563}
+  .log .ln{opacity:0;transform:translateY(4px);animation:slideIn .3s forwards}
+  @keyframes slideIn{to{opacity:1;transform:none}}
+  .log .t{color:#4f5bd5}.log .ok{color:#159b6e}.log .warn{color:#b45309}.log .err{color:#dc2626}
+  .log .dim{color:#94a3b8}
+  .log::-webkit-scrollbar{width:8px}
+  .log::-webkit-scrollbar-thumb{background:#d8dde6;border-radius:8px}
+
+  .legend{display:flex;flex-wrap:wrap;gap:16px;margin-top:18px;padding-top:16px;
+    border-top:1px solid var(--line);font-size:12.5px;color:var(--muted)}
+  .legend span{display:inline-flex;align-items:center;gap:7px}
+  .legend i{width:18px;height:4px;border-radius:3px;display:inline-block}
+
+  /* stack list */
+  .stack{display:grid;grid-template-columns:repeat(auto-fill,minmax(200px,1fr));gap:14px}
+  .stk{display:flex;gap:14px;align-items:flex-start;background:#fff;border:1px solid var(--line);
+    border-radius:14px;padding:16px}
+  .stk .em{font-size:22px;line-height:1}
+  .stk b{display:block;font-size:14.5px}
+  .stk small{color:var(--muted);font-size:12.5px;font-family:var(--mono)}
+
+  /* sequence */
+  .flow{display:grid;grid-template-columns:repeat(3,1fr);gap:18px;margin-top:8px}
+  @media(max-width:860px){.flow{grid-template-columns:1fr}}
+  .flow .fcard{background:#fff;border:1px solid var(--line);border-radius:var(--radius);padding:22px}
+  .flow h4{margin:0 0 14px;display:flex;align-items:center;gap:9px;font-size:16px}
+  .flow h4 .tag{font-family:var(--mono);font-size:10px;padding:3px 8px;border-radius:6px;color:#fff}
+  .tag.w{background:var(--accent)}.tag.r{background:var(--green)}.tag.d{background:var(--red)}
+  ol.steps{margin:0;padding-left:0;list-style:none;counter-reset:s}
+  ol.steps li{position:relative;padding:0 0 14px 34px;color:var(--muted);font-size:13.5px}
+  ol.steps li:before{counter-increment:s;content:counter(s);position:absolute;left:0;top:0;
+    width:22px;height:22px;border-radius:50%;background:var(--accent-soft);color:var(--accent);
+    font-family:var(--mono);font-size:11px;font-weight:700;display:grid;place-items:center}
+  ol.steps li b{color:var(--ink);font-weight:600}
+  ol.steps li:last-child{padding-bottom:0}
+
+  .note{background:var(--accent-soft);border:1px solid #dfe3ff;border-radius:12px;
+    padding:14px 16px;font-size:13.5px;color:#3a40a8;margin-top:18px}
+
+  /* ---------- protocol sequence visualizer ---------- */
+  .proto{margin-top:26px}
+  .proto-tabs{display:flex;flex-wrap:wrap;gap:9px;margin-bottom:18px}
+  .ptab{appearance:none;border:1px solid var(--line);background:#fff;color:var(--ink);
+    font-family:var(--sans);font-size:14px;font-weight:600;padding:10px 17px;border-radius:11px;
+    cursor:pointer;transition:all .18s ease;display:inline-flex;gap:9px;align-items:center}
+  .ptab:hover{border-color:var(--accent);transform:translateY(-1px)}
+  .ptab.active{background:var(--ink);color:#fff;border-color:var(--ink)}
+  .ptab.active .k{box-shadow:0 0 0 3px rgba(255,255,255,.18)}
+  .ptab .k{width:8px;height:8px;border-radius:50%}
+  .preplay{margin-left:auto;appearance:none;border:1px solid var(--line);background:#fff;
+    color:var(--muted);font-family:var(--mono);font-size:12.5px;font-weight:600;padding:10px 15px;
+    border-radius:11px;cursor:pointer;transition:all .18s ease}
+  .preplay:hover{border-color:var(--accent);color:var(--accent)}
+  @media(max-width:560px){.preplay{margin-left:0}}
+
+  .proto-body{display:grid;grid-template-columns:1.5fr .95fr;gap:20px;align-items:stretch}
+  @media(max-width:860px){.proto-body{grid-template-columns:1fr}}
+  .seqwrap{background:linear-gradient(180deg,#fcfdff,#f1f4f9);border:1px solid var(--line);
+    border-radius:18px;overflow:hidden;padding:6px}
+
+  /* sequence svg */
+  .ll-line{stroke:#d3d9e2;stroke-width:1.6;stroke-dasharray:3 6}
+  .ll-head rect{fill:#fff;stroke:#d6dbe3;stroke-width:1.6;
+    filter:drop-shadow(0 4px 10px rgba(20,24,50,.06))}
+  .ll-head .t{font-family:var(--sans);font-weight:650;fill:var(--ink);font-size:14px}
+  .ll-head .s{font-family:var(--mono);fill:var(--muted);font-size:10.5px}
+  .ll-head.lit rect{stroke-width:2.4}
+  .msg-line{fill:none;stroke-linecap:round}
+  .msg-head{stroke:none}
+  .msg-label{font-family:var(--mono);font-size:12px;font-weight:600;text-anchor:middle}
+  .msg-sub{font-family:var(--mono);font-size:10px;fill:var(--muted);text-anchor:middle}
+
+  .seqsteps{margin:0;padding:0;list-style:none;display:flex;flex-direction:column;gap:8px;
+    counter-reset:ps}
+  .seqstep{position:relative;padding:13px 15px 13px 46px;border:1px solid var(--line);
+    border-radius:13px;background:#fff;transition:all .25s ease;opacity:.55}
+  .seqstep:before{counter-increment:ps;content:counter(ps);position:absolute;left:13px;top:12px;
+    width:23px;height:23px;border-radius:50%;background:#eef0f4;color:var(--muted);
+    font-family:var(--mono);font-size:11px;font-weight:700;display:grid;place-items:center;transition:all .25s ease}
+  .seqstep .sl{font-weight:650;font-size:14px;display:flex;align-items:center;gap:8px}
+  .seqstep .sl code{font-family:var(--mono);font-size:12.5px;background:#f1f3f7;
+    padding:1px 6px;border-radius:6px;color:var(--ink)}
+  .seqstep .sd{color:var(--muted);font-size:13px;margin-top:3px}
+  .seqstep.active{opacity:1;border-color:var(--accent);background:var(--accent-soft);
+    box-shadow:0 10px 24px -16px rgba(91,108,255,.6)}
+  .seqstep.active:before{background:var(--accent);color:#fff}
+  .seqstep.done{opacity:1}
+  .seqstep.done:before{background:var(--green);color:#fff;content:"✓"}
+
+  footer{padding:48px 0 64px;color:var(--muted);font-size:13px;text-align:center}
+  footer .wrap{display:flex;flex-direction:column;gap:6px}
+  .mono{font-family:var(--mono)}
+</style>
+</head>
+<body>
+
+<nav>
+  <div class="wrap">
+    <div class="brand"><span class="dot"></span> GFS&nbsp;Clone</div>
+    <div class="nav-links">
+      <a href="#architecture">Architecture</a>
+      <a href="#sim">Simulation</a>
+      <a href="#protocol">Protocol</a>
+      <a href="#fault">Fault tolerance</a>
+      <a href="#stack">Stack</a>
+    </div>
+  </div>
+</nav>
+
+<header class="hero">
+  <div class="wrap">
+    <div class="eyebrow">Distributed Systems · Google File System</div>
+    <h1>A distributed file system,<br><span class="grad">built from first principles.</span></h1>
+    <p class="lede">Files are sharded into fixed 1&nbsp;KB chunks, replicated across storage
+      servers, and indexed by a single metadata authority — so the cluster keeps serving
+      reads and writes even when a node disappears.</p>
+    <div class="chips">
+      <span class="chip"><b>1 KB</b> fixed chunks</span>
+      <span class="chip"><b>×3</b> replication</span>
+      <span class="chip"><b>4</b> storage servers</span>
+      <span class="chip"><b>gRPC</b> transport</span>
+      <span class="chip"><b>Survives</b> 1 node loss</span>
+    </div>
+  </div>
+</header>
+
+<!-- ARCHITECTURE -->
+<section id="architecture">
+  <div class="wrap">
+    <p class="kicker">01 — Architecture</p>
+    <h2>Three roles, one clean separation</h2>
+    <p class="section-lede">Borrowing the core idea of Google's GFS: keep the
+      <b>metadata layer</b> independent from the <b>storage layer</b>, and let clients
+      talk to each directly.</p>
+
+    <div class="grid cols-3" style="margin-top:28px">
+      <div class="card">
+        <div class="ic">◆</div>
+        <h3>Naming server</h3>
+        <p>The single <b>metadata authority</b>. It tracks every file → chunk → replica
+          location, hands clients a placement plan on write and locations on read, and
+          orchestrates deletes and self-healing. It never stores or proxies chunk content.</p>
+      </div>
+      <div class="card">
+        <div class="ic">▦</div>
+        <h3>Storage servers</h3>
+        <p>The <b>chunkservers</b>. Each holds only the subset of 1&nbsp;KB chunks assigned to
+          it, one file per chunk on the local file system. They heartbeat the master and
+          serve chunk bytes straight to clients.</p>
+      </div>
+      <div class="card">
+        <div class="ic">❯</div>
+        <h3>Client library</h3>
+        <p>Hides distribution entirely. It splits files into chunks, asks the master where
+          things go, and reads/writes chunk bytes <b>directly to the storage servers</b> in
+          parallel — the master is never in the data path.</p>
+      </div>
+    </div>
+
+    <div class="grid cols-3" style="margin-top:18px">
+      <div class="card">
+        <div class="ic">⧉</div>
+        <h3>Sharding</h3>
+        <p>Files are split into fixed-size 1&nbsp;KB chunks. Each chunk gets a globally
+          unique id and is placed round-robin across the live servers for balance.</p>
+      </div>
+      <div class="card">
+        <div class="ic">⎘</div>
+        <h3>Replication</h3>
+        <p>Every chunk lives on <b>3 of the 4</b> storage servers. The spare lets the cluster
+          re-replicate onto a healthy node after a single failure.</p>
+      </div>
+      <div class="card">
+        <div class="ic">♺</div>
+        <h3>Self-healing</h3>
+        <p>A background loop on the master spots under-replicated chunks after a node dies
+          and copies them from a live replica to a spare — restoring the target factor.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- SIMULATION -->
+<section id="sim">
+  <div class="wrap">
+    <p class="kicker">02 — Live simulation</p>
+    <h2>Watch the cluster work</h2>
+    <p class="section-lede">Trigger real operations and faults. Tokens travelling the wires
+      are RPCs; the log mirrors what the actual services do.</p>
+
+    <div class="stage">
+      <div class="stage-head">
+        <div class="stage-title"><span class="dot" style="width:9px;height:9px;background:var(--accent);border-radius:50%;display:inline-block"></span> gfs-cluster · docker compose</div>
+        <div class="live"><span class="pip"></span> heartbeats every 5s</div>
+      </div>
+
+      <div class="stage-body">
+        <div class="diagram">
+          <svg id="svg" viewBox="0 0 960 560" role="img" aria-label="Cluster diagram"></svg>
+        </div>
+
+        <div class="side">
+          <div class="controls">
+            <div class="ctl-group">
+              <div class="gl">Client operations</div>
+              <div class="btns">
+                <button class="op" data-op="write"><span class="k blue"></span>Write file</button>
+                <button class="op" data-op="read"><span class="k greenk"></span>Read file</button>
+                <button class="op" data-op="delete"><span class="k redk"></span>Delete file</button>
+              </div>
+            </div>
+            <div class="ctl-group">
+              <div class="gl">Inject faults</div>
+              <div class="btns">
+                <button class="op danger" data-op="kill"><span class="k redk"></span>Kill a node</button>
+                <button class="op good" data-op="heal"><span class="k greenk"></span>Self-heal</button>
+                <button class="op" data-op="reset"><span class="k amberk"></span>Reset</button>
+              </div>
+            </div>
+          </div>
+
+          <div class="log" id="log"></div>
+        </div>
+      </div>
+
+      <div class="legend">
+        <span><i style="background:#5b6cff"></i> metadata RPC</span>
+        <span><i style="background:#28c08a"></i> data read</span>
+        <span><i style="background:#64748b"></i> data write</span>
+        <span><i style="background:#f5a524"></i> heartbeat</span>
+        <span><i style="background:#ff5d5d"></i> failure / delete</span>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- PROTOCOL -->
+<section id="protocol">
+  <div class="wrap">
+    <p class="kicker">03 — Communication protocol</p>
+    <h2>How a client talks to the cluster</h2>
+    <p class="section-lede">Metadata goes through the master; bulk data goes straight to the
+      storage servers. Every call is a gRPC RPC defined in <span class="mono">gfs.proto</span>.</p>
+
+    <div class="proto">
+      <div class="proto-tabs">
+        <button class="ptab active" data-flow="write"><span class="k blue"></span>Write a file</button>
+        <button class="ptab" data-flow="read"><span class="k greenk"></span>Read a file</button>
+        <button class="ptab" data-flow="delete"><span class="k redk"></span>Delete a file</button>
+        <button class="preplay" id="preplay">↻&nbsp; Replay</button>
+      </div>
+      <div class="proto-body">
+        <div class="seqwrap">
+          <svg id="seq" viewBox="0 0 720 470" role="img" aria-label="Sequence diagram"></svg>
+        </div>
+        <ol class="seqsteps" id="seqsteps"></ol>
+      </div>
+      <div class="note" id="protofoot"></div>
+    </div>
+  </div>
+</section>
+
+<!-- FAULT TOLERANCE -->
+<section id="fault">
+  <div class="wrap">
+    <p class="kicker">04 — Fault tolerance</p>
+    <h2>What survives, and what doesn't</h2>
+    <p class="section-lede">A core design goal: reason explicitly about every failure mode.
+      Try <b>Kill a node</b> then <b>Self-heal</b> in the simulation above to see it live.</p>
+
+    <div class="grid cols-2" style="margin-top:26px">
+      <div class="card">
+        <div class="ic" style="background:#fff0f0;color:var(--red)">▦</div>
+        <h3>A storage server goes down</h3>
+        <p><b>Recoverable.</b> Reads keep working from the other replicas; the master routes
+          clients to live copies. Writes continue as long as ≥3 servers are live. The healer
+          re-replicates affected chunks onto the spare to restore the ×3 factor.</p>
+      </div>
+      <div class="card">
+        <div class="ic" style="background:#fff0f0;color:var(--red)">◆</div>
+        <h3>The naming server goes down</h3>
+        <p><b>Single point of failure for availability.</b> No new metadata operations can run.
+          But chunk data stays safe on disk and metadata is durable in SQLite — once the master
+          restarts and storage servers re-register, the cluster recovers fully.</p>
+      </div>
+      <div class="card">
+        <div class="ic" style="background:#eef9f4;color:var(--green)">⎘</div>
+        <h3>The replication math</h3>
+        <p>With ×3 replication across 4 servers, the cluster <b>survives any single
+          simultaneous storage loss</b> with full automatic recovery. Some reads survive even two
+          losses — as long as every chunk keeps at least one live replica.</p>
+      </div>
+      <div class="card">
+        <div class="ic" style="background:#fff7e9;color:var(--amber)">⚠</div>
+        <h3>Where data is actually lost</h3>
+        <p><b>Unrecoverable</b> only if <i>all three</i> replicas of a chunk fail before healing
+          completes. Interrupted writes leave harmless <i>pending</i> metadata and orphan chunks,
+          both garbage-collected automatically.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<!-- STACK -->
+<section id="stack">
+  <div class="wrap">
+    <p class="kicker">05 — Technology stack</p>
+    <h2>Built with</h2>
+    <p class="section-lede">A small, boring, dependable toolchain — fully containerised.</p>
+
+    <div class="stack" style="margin-top:26px">
+      <div class="stk"><span class="em">🐍</span><div><b>Python 3.12</b><small>core services</small></div></div>
+      <div class="stk"><span class="em">🔌</span><div><b>gRPC + Protobuf</b><small>service contracts</small></div></div>
+      <div class="stk"><span class="em">🗃️</span><div><b>SQLite · WAL</b><small>durable metadata</small></div></div>
+      <div class="stk"><span class="em">🐳</span><div><b>Docker Compose</b><small>1 master + 4 storage</small></div></div>
+      <div class="stk"><span class="em">📈</span><div><b>Prometheus</b><small>metrics scraping</small></div></div>
+      <div class="stk"><span class="em">📊</span><div><b>Grafana</b><small>live dashboards</small></div></div>
+      <div class="stk"><span class="em">⚡</span><div><b>uv</b><small>dependency mgmt</small></div></div>
+      <div class="stk"><span class="em">🧵</span><div><b>Thread pools</b><small>concurrent RPCs</small></div></div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    <div class="brand" style="justify-content:center"><span class="dot"></span> GFS Clone</div>
+    <div>Group project · Cloud Computing / Distributed Systems</div>
+    <div class="mono" style="color:#9aa0aa">docker compose up --build · grafana :3000 · prometheus :9090</div>
+  </div>
+</footer>
+
+<script>
+const SVGNS="http://www.w3.org/2000/svg";
+const svg=document.getElementById("svg");
+const logEl=document.getElementById("log");
+
+// ---------- node + link model ----------
+const NODES={
+  client :{x:120,y:280,w:140,h:64,label:"Client",sub:"library"},
+  naming :{x:470,y:96 ,w:170,h:64,label:"Naming server",sub:"metadata master"},
+  s1:{x:820,y:120,w:130,h:54,label:"storage1",sub:"chunks"},
+  s2:{x:820,y:235,w:130,h:54,label:"storage2",sub:"chunks"},
+  s3:{x:820,y:350,w:130,h:54,label:"storage3",sub:"chunks"},
+  s4:{x:820,y:465,w:130,h:54,label:"storage4",sub:"chunks"},
+};
+const STORES=["s1","s2","s3","s4"];
+// links: type controls colour. data=client↔storage, ctrl=naming↔storage, meta=client↔naming
+const LINKS=[
+  ["client","naming","meta"],
+  ["client","s1","data"],["client","s2","data"],["client","s3","data"],["client","s4","data"],
+  ["naming","s1","ctrl"],["naming","s2","ctrl"],["naming","s3","ctrl"],["naming","s4","ctrl"],
+];
+const COL={meta:"#5b6cff",data:"#b3bccb",ctrl:"#c7cedb"};
+
+// runtime state
+let alive={s1:true,s2:true,s3:true,s4:true};
+let replicas=new Set(["s1","s2","s3"]); // where the demo file lives
+let busy=false;
+let speed=1;
+
+// ---------- render ----------
+function center(n){return {x:NODES[n].x,y:NODES[n].y}}
+function rectXY(n){return {x:NODES[n].x-NODES[n].w/2,y:NODES[n].y-NODES[n].h/2}}
+
+function el(tag,attrs,parent){
+  const e=document.createElementNS(SVGNS,tag);
+  for(const k in attrs)e.setAttribute(k,attrs[k]);
+  (parent||svg).appendChild(e);return e;
+}
+
+const linkLayer=el("g",{}),tokenLayer=el("g",{}),nodeLayer=el("g",{});
+function draw(){
+  // links
+  LINKS.forEach(([a,b,t])=>{
+    const A=center(a),B=center(b);
+    el("line",{x1:A.x,y1:A.y,x2:B.x,y2:B.y,class:"link",
+      stroke:COL[t],"stroke-width":t==="meta"?2.4:1.4,
+      "stroke-dasharray":t==="ctrl"?"2 6":"none",opacity:.9},linkLayer);
+  });
+  // nodes
+  for(const id in NODES){
+    const n=NODES[id],p=rectXY(id);
+    const g=el("g",{class:"node",id:"node-"+id},nodeLayer);
+    el("rect",{x:p.x,y:p.y,width:n.w,height:n.h,rx:13,
+      fill:"#ffffff",stroke:"#d6dbe3","stroke-width":1.8},g);
+    el("text",{x:n.x,y:n.y-3,"text-anchor":"middle",class:"nlabel"},g).textContent=n.label;
+    el("text",{x:n.x,y:n.y+15,"text-anchor":"middle",class:"nsub"},g).textContent=n.sub;
+  }
+  refreshReplicaBadges();
+}
+function refreshReplicaBadges(){
+  // small "●×3" style indicator under naming + replica dots on storage
+  STORES.forEach(s=>{
+    const old=document.getElementById("rb-"+s); if(old) old.remove();
+    const n=NODES[s];
+    const has=replicas.has(s);
+    const g=el("g",{id:"rb-"+s},nodeLayer);
+    el("circle",{cx:n.x+n.w/2-12,cy:n.y-n.h/2+12,r:5,
+      fill:has?(alive[s]?"#28c08a":"#ff5d5d"):"#ccd3dd"},g);
+  });
+}
+
+// node state helpers
+function setDead(id,dead){
+  const g=document.getElementById("node-"+id);
+  g.classList.toggle("dead",dead);
+}
+function flashHeal(id,on){document.getElementById("node-"+id).classList.toggle("heal",on)}
+
+// ---------- logging ----------
+function now(){const d=new Date();return d.toTimeString().slice(0,8)}
+function log(html,cls){
+  const ln=document.createElement("div");
+  ln.className="ln";
+  ln.innerHTML=`<span class="dim">${now()}</span> ${html}`;
+  if(cls)ln.classList.add(cls);
+  logEl.appendChild(ln);
+  logEl.scrollTop=logEl.scrollHeight;
+  // trim
+  while(logEl.children.length>120)logEl.removeChild(logEl.firstChild);
+}
+
+// ---------- token animation ----------
+function easeInOut(t){return t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2}
+function token(from,to,color,opts={}){
+  return new Promise(res=>{
+    const A=center(from),B=center(to);
+    const r=opts.r||6.5, dur=(opts.dur||650)/speed;
+    const c=el("circle",{cx:A.x,cy:A.y,r,fill:color,opacity:opts.faint?.7:1},tokenLayer);
+    if(!opts.faint)c.setAttribute("filter","url(#glow)");
+    const start=performance.now();
+    (function frame(t){
+      const k=Math.min(1,(t-start)/dur),e=easeInOut(k);
+      c.setAttribute("cx",A.x+(B.x-A.x)*e);
+      c.setAttribute("cy",A.y+(B.y-A.y)*e);
+      if(k<1)requestAnimationFrame(frame);else{c.remove();res()}
+    })(start);
+  });
+}
+// glow filter
+(function(){
+  const defs=el("defs",{});
+  const f=el("filter",{id:"glow",x:"-60%",y:"-60%",width:"220%",height:"220%"},defs);
+  el("feGaussianBlur",{stdDeviation:"3.2",result:"b"},f);
+  const m=el("feMerge",{},f);el("feMergeNode",{in:"b"},m);el("feMergeNode",{in:"SourceGraphic"},m);
+})();
+
+const wait=ms=>new Promise(r=>setTimeout(r,ms/speed));
+
+// ---------- operations ----------
+function liveReplicas(){return [...replicas].filter(s=>alive[s])}
+function liveStores(){return STORES.filter(s=>alive[s])}
+
+async function opWrite(){
+  if(liveStores().length<3){
+    log(`<span class="err">✗ CreateFile rejected</span> — need 3 live storage servers, only ${liveStores().length} live`,"err");
+    return;
+  }
+  // place on first 3 live servers
+  const targets=liveStores().slice(0,3);
+  replicas=new Set(targets);
+  log(`<span class="t">CreateFile</span> client → naming · reserving metadata`);
+  await token("client","naming","#5b6cff");
+  await wait(120);
+  log(`naming → client · placement plan: <b>${targets.join(", ")}</b>`);
+  await token("naming","client","#5b6cff");
+  await wait(120);
+  log(`<span class="t">StoreChunks</span> client → storage · batched 1 KB chunks, in parallel`);
+  await Promise.all(targets.map(s=>token("client",s,"#64748b")));
+  await Promise.all(targets.map(s=>token(s,"client","#64748b",{r:5})));
+  refreshReplicaBadges();
+  log(`<span class="t">CommitFile</span> client → naming · file committed`);
+  await token("client","naming","#5b6cff");
+  log(`<span class="ok">✓ write complete</span> — 1 file, ×3 replicas on ${targets.join(", ")}`,"ok");
+}
+
+async function opRead(){
+  const live=liveReplicas();
+  if(live.length===0){log(`<span class="err">✗ read failed</span> — no live replica holds this file`,"err");return}
+  log(`<span class="t">GetFile</span> client → naming · requesting chunk locations`);
+  await token("client","naming","#5b6cff");
+  await wait(100);
+  log(`naming → client · locations (live first): <b>${live.join(", ")}</b>`);
+  await token("naming","client","#5b6cff");
+  await wait(100);
+  const src=live[0];
+  // show fallback if the primary replica is dead
+  const primary=[...replicas][0];
+  if(!alive[primary]){
+    log(`<span class="warn">↻ ${primary} unreachable</span> — falling back to live replica ${src}`,"warn");
+  }
+  log(`<span class="t">GetChunk</span> client → ${src} · fetching chunks`);
+  await token("client",src,"#28c08a");
+  await token(src,"client","#28c08a",{r:4});
+  log(`<span class="ok">✓ read complete</span> — chunks reassembled in order`,"ok");
+}
+
+async function opDelete(){
+  if(replicas.size===0){log(`<span class="dim">nothing to delete — no file present</span>`);return}
+  const holders=[...replicas];
+  log(`<span class="t">DeleteFile</span> client → naming · removing metadata first`);
+  await token("client","naming","#ff5d5d");
+  await wait(120);
+  log(`naming → storage · fan-out DeleteChunk to ${holders.join(", ")} (parallel)`);
+  await Promise.all(holders.map(s=>token("naming",s,"#ff5d5d")));
+  replicas=new Set();
+  refreshReplicaBadges();
+  await token("naming","client","#ff5d5d");
+  log(`<span class="ok">✓ deleted</span> — metadata gone, replicas dropped`,"ok");
+}
+
+async function opKill(){
+  const candidates=liveStores();
+  if(candidates.length<=1){log(`<span class="warn">refusing to kill the last storage server</span>`,"warn");return}
+  // prefer killing a node that holds the file, to make healing meaningful
+  const holders=candidates.filter(s=>replicas.has(s));
+  const victim=(holders.length?holders:candidates)[Math.floor(Math.random()*(holders.length?holders.length:candidates.length))];
+  alive[victim]=false;
+  log(`<span class="err">✗ ${victim} crashed</span> — heartbeats stop`,"err");
+  setDead(victim,true);
+  refreshReplicaBadges();
+  await wait(700);
+  log(`naming · no heartbeat from ${victim} for 15s → <b>marked dead</b>`,"warn");
+  const lr=liveReplicas().length;
+  if(replicas.has(victim)){
+    log(`naming · file now under-replicated (${lr}/3 live replicas)`,"warn");
+  }else{
+    log(`<span class="dim">${victim} held no replica of this file — reads unaffected</span>`);
+  }
+}
+
+async function opHeal(){
+  const dead=STORES.filter(s=>!alive[s]);
+  if(dead.length===0){log(`<span class="dim">cluster healthy — nothing to heal</span>`);return}
+  if(liveStores().length<3){
+    log(`<span class="warn">cannot restore ×3 — fewer than 3 live servers</span>`,"warn");
+  }
+  // for each dead node that held a replica, copy to a live spare not in the set
+  let healedAny=false;
+  for(const d of dead){
+    if(!replicas.has(d))continue;
+    const spare=liveStores().find(s=>!replicas.has(s));
+    const source=liveReplicas()[0];
+    if(!spare||!source){continue}
+    log(`<span class="t">heal</span> under-replicated chunk · copy ${source} → ${spare}`);
+    flashHeal(spare,true);
+    await token("naming",spare,"#28c08a"); // ReplicateChunk(target, source)
+    await token(spare,source,"#28c08a",{r:4}); // target pulls from source
+    await token(source,spare,"#28c08a"); // bytes flow back
+    replicas.delete(d); replicas.add(spare);
+    refreshReplicaBadges();
+    await wait(150);
+    flashHeal(spare,false);
+    log(`<span class="ok">✓ replica restored on ${spare}</span> — back to ×3`,"ok");
+    healedAny=true;
+  }
+  if(!healedAny)log(`<span class="dim">dead node held no replicas — metadata already at ×3</span>`);
+}
+
+function opReset(){
+  alive={s1:true,s2:true,s3:true,s4:true};
+  replicas=new Set(["s1","s2","s3"]);
+  STORES.forEach(s=>{setDead(s,false);flashHeal(s,false)});
+  refreshReplicaBadges();
+  log(`<span class="dim">— cluster reset · 4 live servers, file on s1, s2, s3 —</span>`);
+}
+
+// ---------- heartbeats ----------
+function heartbeatTick(){
+  if(document.hidden)return;
+  liveStores().forEach((s,i)=>{
+    setTimeout(()=>token(s,"naming","#f5a524",{r:3.5,faint:true,dur:900}),i*90);
+  });
+}
+
+// ---------- wiring ----------
+const OPS={write:opWrite,read:opRead,delete:opDelete,kill:opKill,heal:opHeal};
+async function run(op){
+  if(busy)return;
+  busy=true;
+  document.querySelectorAll("button.op").forEach(b=>b.disabled=true);
+  try{
+    if(op==="reset")opReset();
+    else await OPS[op]();
+  }finally{
+    busy=false;
+    document.querySelectorAll("button.op").forEach(b=>b.disabled=false);
+  }
+}
+document.querySelectorAll("button.op").forEach(b=>{
+  b.addEventListener("click",()=>run(b.dataset.op));
+});
+
+// ---------- boot ----------
+draw();
+log(`<span class="dim">cluster online · naming + 4 storage · replication ×3</span>`);
+log(`<span class="dim">try a write, then kill a node and self-heal →</span>`);
+setInterval(heartbeatTick,2600);
+heartbeatTick();
+</script>
+
+<script>
+/* ===== 03 — Communication protocol: animated sequence diagram ===== */
+(function(){
+const NS="http://www.w3.org/2000/svg";
+const seq=document.getElementById("seq");
+const stepsEl=document.getElementById("seqsteps");
+const footEl=document.getElementById("protofoot");
+if(!seq)return;
+
+// lifelines
+const LANE={client:{x:115,label:"Client",sub:"library"},
+            naming:{x:360,label:"Naming server",sub:"metadata master"},
+            storage:{x:605,label:"Storage servers",sub:"chunkservers ×N"}};
+const TOP=92, ROW0=140, ROWH=52, BOTTOM=452;
+const C={write:"#5b6cff",read:"#28c08a",delete:"#ff5d5d"};
+
+// flow definitions — each event is one arrow; dir:"req"|"ret"; self:true for self-loop
+const FLOWS={
+  write:{color:C.write,foot:"⚡ The master is never in the data path — it only hands out a placement plan. Bulk chunk data flows straight to the storage servers, batched (~1 MB per RPC) and uploaded to all replicas in parallel.",
+    events:[
+      {from:"client",to:"naming",rpc:"CreateFile",sub:"reserve",dir:"req",
+        label:"CreateFile",desc:"Client asks the master to reserve metadata for the file."},
+      {from:"naming",to:"client",rpc:"placement plan",dir:"ret",
+        label:"← placement plan",desc:"Master replies with which 3 servers hold each 1 KB chunk."},
+      {from:"client",to:"storage",rpc:"StoreChunks",sub:"×3 · parallel",dir:"req",parallel:true,
+        label:"StoreChunks",desc:"Client splits the file into 1 KB chunks and uploads them to all 3 target servers at once."},
+      {from:"storage",to:"client",rpc:"ack",dir:"ret",parallel:true,
+        label:"← ack ×3",desc:"Each storage server persists its chunks to disk and acknowledges."},
+      {from:"client",to:"naming",rpc:"CommitFile",dir:"req",
+        label:"CommitFile",desc:"Master flips the file from pending → committed. The write is durable."},
+      {from:"naming",to:"client",rpc:"committed",dir:"ret",
+        label:"← committed",desc:"Done — the file is now readable."},
+    ]},
+  read:{color:C.read,foot:"↺ If a replica is unreachable, the client transparently retries the next one. Reads keep working as long as every chunk has at least one live replica.",
+    events:[
+      {from:"client",to:"naming",rpc:"GetFile",dir:"req",
+        label:"GetFile",desc:"Client asks the master where the chunks live."},
+      {from:"naming",to:"client",rpc:"locations",dir:"ret",
+        label:"← locations",desc:"Master returns chunk locations, live replicas first."},
+      {from:"client",to:"storage",rpc:"GetChunk",sub:"parallel",dir:"req",parallel:true,
+        label:"GetChunk",desc:"Client fetches each chunk from any responding replica, concurrently."},
+      {from:"storage",to:"client",rpc:"chunk data",dir:"ret",parallel:true,
+        label:"← chunk data",desc:"Storage servers stream the raw chunk bytes back."},
+      {from:"client",to:"client",rpc:"reassemble",dir:"self",
+        label:"reassemble",desc:"Client orders the chunks by index and returns the original file."},
+    ]},
+  delete:{color:C.delete,foot:"🗑️ Metadata is removed first, so the file disappears instantly. A storage server that is down simply misses the delete; its now-unreachable chunks become orphans, cleaned up on its next restart.",
+    events:[
+      {from:"client",to:"naming",rpc:"DeleteFile",dir:"req",
+        label:"DeleteFile",desc:"Client requests deletion; the master drops the metadata first."},
+      {from:"naming",to:"storage",rpc:"DeleteChunk",sub:"fan-out · parallel",dir:"req",parallel:true,
+        label:"DeleteChunk",desc:"Master fans deletes out to every replica in parallel."},
+      {from:"storage",to:"naming",rpc:"ok",dir:"ret",parallel:true,
+        label:"← ok",desc:"Live servers drop the chunk files from disk."},
+      {from:"naming",to:"client",rpc:"deleted",dir:"ret",
+        label:"← deleted",desc:"File is gone. GetFileSize would now report not-found."},
+    ]},
+};
+
+const E=(tag,attrs,parent)=>{const e=document.createElementNS(NS,tag);
+  for(const k in attrs)e.setAttribute(k,attrs[k]);(parent||seq).appendChild(e);return e;};
+const easeInOut=t=>t<.5?2*t*t:1-Math.pow(-2*t+2,2)/2;
+
+// static layers
+const baseLayer=E("g",{}),msgLayer=E("g",{}),headLayer=E("g",{});
+// arrowhead marker defs
+(function(){
+  const defs=E("defs",{});
+  const fl=E("filter",{id:"seqglow",x:"-60%",y:"-60%",width:"220%",height:"220%"},defs);
+  E("feGaussianBlur",{stdDeviation:"2.6",result:"b"},fl);
+  const mg=E("feMerge",{},fl);E("feMergeNode",{in:"b"},mg);E("feMergeNode",{in:"SourceGraphic"},mg);
+  ["write","read","delete"].forEach(f=>{
+    ["req","ret"].forEach(d=>{
+      const m=E("marker",{id:`ah-${f}-${d}`,markerWidth:9,markerHeight:9,refX:7,refY:4,
+        orient:"auto",markerUnits:"userSpaceOnUse"},defs);
+      E("path",{d:"M0,0 L8,4 L0,8 Z",fill:C[f],opacity:d==="ret"?.6:1},m);
+    });
+  });
+})();
+
+function drawBase(){
+  baseLayer.replaceChildren(); headLayer.replaceChildren();
+  for(const id in LANE){
+    const L=LANE[id];
+    E("line",{x1:L.x,y1:TOP,x2:L.x,y2:BOTTOM,class:"ll-line"},baseLayer);
+    const g=E("g",{class:"ll-head",id:"llh-"+id},headLayer);
+    E("rect",{x:L.x-78,y:24,width:156,height:48,rx:12},g);
+    E("text",{x:L.x,y:46,"text-anchor":"middle",class:"t"},g).textContent=L.label;
+    E("text",{x:L.x,y:62,"text-anchor":"middle",class:"s"},g).textContent=L.sub;
+  }
+}
+
+const wait=ms=>new Promise(r=>setTimeout(r,ms));
+let gen=0, playing=false;
+
+function renderSteps(flow){
+  stepsEl.replaceChildren();
+  FLOWS[flow].events.forEach((ev,i)=>{
+    const li=document.createElement("li");
+    li.className="seqstep"; li.id="ss-"+i;
+    li.innerHTML=`<div class="sl"><code>${ev.label}</code></div><div class="sd">${ev.desc}</div>`;
+    stepsEl.appendChild(li);
+  });
+}
+
+function lit(id,on){const e=document.getElementById("llh-"+id);if(e)e.classList.toggle("lit",on);}
+
+// animate one dot along a straight path
+function dot(x1,y1,x2,y2,color,dur,r){
+  return new Promise(res=>{
+    const c=E("circle",{cx:x1,cy:y1,r:r||6,fill:color,filter:"url(#seqglow)"},msgLayer);
+    const t0=performance.now();
+    (function fr(t){const k=Math.min(1,(t-t0)/dur),e=easeInOut(k);
+      c.setAttribute("cx",x1+(x2-x1)*e);c.setAttribute("cy",y1+(y2-y1)*e);
+      if(k<1)requestAnimationFrame(fr);else{c.remove();res();}})(t0);
+  });
+}
+
+async function playEvent(ev,row,color,myGen){
+  if(myGen!==gen)return;
+  const y=ROW0+row*ROWH;
+  const ax=LANE[ev.from].x, bx=LANE[ev.to].x;
+  const ret=ev.dir==="ret";
+  document.getElementById("ss-"+row)?.classList.add("active");
+  lit(ev.to,true);
+
+  if(ev.dir==="self"){
+    // self-loop on the client lane
+    const x=ax, w=46;
+    const p=E("path",{d:`M${x},${y} h${w} v22 h${-w}`,class:"msg-line",
+      stroke:color,"stroke-width":2.4,"marker-end":`url(#ah-${currentFlow}-req)`,
+      "stroke-dasharray":"200","stroke-dashoffset":"200"},msgLayer);
+    E("text",{x:x+w+8,y:y+4,class:"msg-label",fill:color,"text-anchor":"start"},msgLayer)
+      .textContent=ev.rpc;
+    p.animate([{strokeDashoffset:200},{strokeDashoffset:0}],{duration:420,fill:"forwards"});
+    await dot(x,y,x+w,y+11,color,360,5);
+    await dot(x+w,y+22,x,y+22,color,1,0.01);
+  }else{
+    // arrow line + label — span the full distance between the two dashed
+    // lifelines: start exactly on the source line, land the arrowhead on the
+    // target line.
+    const dir=bx>ax?1:-1;
+    const x1=ax, x2=bx-dir*4;
+    const line=E("line",{x1,y1:y,x2,y2:y,class:"msg-line",stroke:color,
+      "stroke-width":ret?2:2.6,"stroke-dasharray":ret?"5 5":"none",
+      "marker-end":`url(#ah-${currentFlow}-${ret?"ret":"req"})`,opacity:ret?.75:1},msgLayer);
+    const draw=Math.abs(x2-x1);
+    line.style.strokeDasharray=ret?"5 5":draw; if(!ret)line.style.strokeDashoffset=draw;
+    if(!ret)line.animate([{strokeDashoffset:draw},{strokeDashoffset:0}],{duration:300,fill:"forwards"});
+    const mx=(x1+x2)/2;
+    E("text",{x:mx,y:y-9,class:"msg-label",fill:color},msgLayer).textContent=ev.label.replace("← ","");
+    if(ev.sub)E("text",{x:mx,y:y+15,class:"msg-sub"},msgLayer).textContent=ev.sub;
+    // packet(s)
+    const fan=ev.parallel?[-8,0,8]:[0];
+    await Promise.all(fan.map((off,i)=>
+      new Promise(r=>setTimeout(()=>dot(x1,y+off,x2,y+off,color,520,ev.parallel?4.5:6).then(r),i*110))
+    ));
+  }
+  if(myGen!==gen)return;
+  lit(ev.to,false);
+  const li=document.getElementById("ss-"+row);
+  if(li){li.classList.remove("active");li.classList.add("done");}
+  await wait(260);
+}
+
+let currentFlow="write";
+async function play(flow){
+  currentFlow=flow; gen++; const myGen=gen; playing=true;
+  msgLayer.replaceChildren();
+  document.querySelectorAll(".ptab").forEach(b=>b.classList.toggle("active",b.dataset.flow===flow));
+  renderSteps(flow);
+  footEl.textContent=FLOWS[flow].foot;
+  const F=FLOWS[flow];
+  await wait(180);
+  for(let i=0;i<F.events.length;i++){
+    if(myGen!==gen)return;
+    await playEvent(F.events[i],i,F.color,myGen);
+  }
+  playing=false;
+}
+
+drawBase();
+document.querySelectorAll(".ptab").forEach(b=>{
+  b.addEventListener("click",()=>play(b.dataset.flow));
+});
+document.getElementById("preplay").addEventListener("click",()=>play(currentFlow));
+
+// auto-play once when scrolled into view
+let seenProto=false;
+new IntersectionObserver((entries)=>{
+  entries.forEach(e=>{if(e.isIntersecting&&!seenProto){seenProto=true;play("write");}});
+},{threshold:.35}).observe(document.getElementById("protocol"));
+
+// render initial steps so the panel isn't empty before first view
+renderSteps("write");
+footEl.textContent=FLOWS.write.foot;
+})();
+</script>
+</body>
+</html>
